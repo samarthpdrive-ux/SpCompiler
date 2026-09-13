@@ -2,10 +2,13 @@ import asyncio
 import shutil
 import tempfile
 import time
-import uuid
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 import os
+import sys
+
+if sys.platform != "win32":
+    import resource
 
 from app.models import RunRequest, RunResponse
 
@@ -31,6 +34,7 @@ RUNNERS = {
 
 class ExecutionService:
     TIMEOUT_SECONDS = 10
+    MAX_OUTPUT_BYTES = 1 * 1024 * 1024  # 1 MB max output limit
     INPUT_FILE_NAME = ".polyworkspace-stdin"
 
     def health_check(self):
@@ -50,6 +54,8 @@ class ExecutionService:
         workspace_dir = tempfile.mkdtemp(prefix="polyworkspace-exec-")
         started_at = time.perf_counter()
         timed_out = False
+        memory_exceeded = False
+        output_exceeded = False
 
         try:
             self._write_project_files(
@@ -60,21 +66,19 @@ class ExecutionService:
 
             command = self._build_execution_command(request.language, entrypoint)
 
-            # Synchronous run wrapper using asyncio loop or direct subprocess run
             try:
                 loop = asyncio.get_running_loop()
             except RuntimeError:
                 loop = None
 
             if loop and loop.is_running():
-                # If called from an async context synchronously or via threadpool
                 import concurrent.futures
                 with concurrent.futures.ThreadPoolExecutor() as pool:
-                    exit_code, stdout, stderr, timed_out = loop.run_until_complete(
+                    exit_code, stdout, stderr, timed_out, memory_exceeded, output_exceeded = loop.run_until_complete(
                         pool.submit(self._execute_sync, command, workspace_dir)
                     )
             else:
-                exit_code, stdout, stderr, timed_out = asyncio.run(
+                exit_code, stdout, stderr, timed_out, memory_exceeded, output_exceeded = asyncio.run(
                     self._execute_async(command, workspace_dir)
                 )
 
@@ -83,7 +87,7 @@ class ExecutionService:
             )
 
             return RunResponse(
-                success=exit_code == 0 and not timed_out,
+                success=exit_code == 0 and not timed_out and not memory_exceeded and not output_exceeded,
                 exit_code=exit_code,
                 stdout=stdout,
                 stderr=stderr,
@@ -99,61 +103,155 @@ class ExecutionService:
         finally:
             shutil.rmtree(workspace_dir, ignore_errors=True)
 
+    def _set_memory_limit(self):
+        if sys.platform != "win32":
+            memory_limit_bytes = 256 * 1024 * 1024  # 256 MB RAM limit
+            try:
+                resource.setrlimit(resource.RLIMIT_AS, (memory_limit_bytes, memory_limit_bytes))
+            except (ValueError, resource.error):
+                pass
+
     async def _execute_async(self, command: list, workspace_dir: str):
         timed_out = False
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *command,
-                cwd=workspace_dir,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
+        memory_exceeded = False
+        output_exceeded = False
+        stdout_data = bytearray()
+        stderr_data = bytearray()
 
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+
+        exec_kwargs = {
+            "cwd": workspace_dir,
+            "stdout": asyncio.subprocess.PIPE,
+            "stderr": asyncio.subprocess.PIPE,
+            "env": env,
+        }
+
+        if sys.platform != "win32":
+            exec_kwargs["preexec_fn"] = self._set_memory_limit
+
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            **exec_kwargs
+        )
+
+        start_time = time.monotonic()
+        recent_chunks = []
+        max_repeats = 15
+
+        async def read_stream(stream, target_array):
+            nonlocal output_exceeded
             try:
-                stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                    process.communicate(), timeout=self.TIMEOUT_SECONDS
-                )
-            except asyncio.TimeoutError:
-                timed_out = True
-                try:
-                    process.kill()
-                except Exception:
-                    pass
-                stdout_bytes, stderr_bytes = await process.communicate()
+                while True:
+                    if time.monotonic() - start_time > self.TIMEOUT_SECONDS:
+                        break
+                    try:
+                        chunk = await asyncio.wait_for(stream.read(256), timeout=0.2)
+                    except asyncio.TimeoutError:
+                        if process.returncode is not None:
+                            break
+                        continue
 
-            exit_code = process.returncode if process.returncode is not None else 1
-            stdout = stdout_bytes.decode("utf-8", errors="replace")
-            stderr = stderr_bytes.decode("utf-8", errors="replace")
+                    if not chunk:
+                        break
+                    target_array.extend(chunk)
 
-            if timed_out:
-                stderr += (
-                    f"\nExecution stopped after "
-                    f"{self.TIMEOUT_SECONDS} seconds.\n"
-                )
+                    chunk_str = chunk.decode("utf-8", errors="replace")
+                    recent_chunks.append(chunk_str)
+                    if len(recent_chunks) > max_repeats:
+                        recent_chunks.pop(0)
+                        if len(set(recent_chunks)) == 1 and len(chunk_str.strip()) > 0:
+                            output_exceeded = True
+                            try:
+                                process.kill()
+                            except Exception:
+                                pass
+                            break
 
-            return exit_code, stdout, stderr, timed_out
-        except Exception as e:
-            return 1, "", str(e), False
+                    if len(stdout_data) + len(stderr_data) > self.MAX_OUTPUT_BYTES:
+                        output_exceeded = True
+                        try:
+                            process.kill()
+                        except Exception:
+                            pass
+                        break
+            except Exception:
+                pass
+
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(
+                    read_stream(process.stdout, stdout_data),
+                    read_stream(process.stderr, stderr_data),
+                    process.wait()
+                ),
+                timeout=self.TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            timed_out = True
+            try:
+                process.kill()
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(process.wait(), timeout=1.0)
+            except Exception:
+                pass
+
+        exit_code = process.returncode if process.returncode is not None else 1
+        if exit_code < 0 or exit_code == 137:
+            memory_exceeded = True
+
+        stdout = bytes(stdout_data).decode("utf-8", errors="replace")
+        stderr = bytes(stderr_data).decode("utf-8", errors="replace")
+
+        if output_exceeded:
+            stderr += "\nExecution stopped: Output limit or infinite print loop detected.\n"
+        if memory_exceeded:
+            stderr += "\nExecution stopped: Memory limit exceeded.\n"
+        if timed_out:
+            stderr += f"\nExecution stopped after {self.TIMEOUT_SECONDS} seconds.\n"
+
+        return exit_code, stdout, stderr, timed_out, memory_exceeded, output_exceeded
 
     def _execute_sync(self, command: list, workspace_dir: str):
         import subprocess
         timed_out = False
+        memory_exceeded = False
+        output_exceeded = False
         try:
-            result = subprocess.run(
-                command,
-                cwd=workspace_dir,
-                capture_output=True,
-                timeout=self.TIMEOUT_SECONDS,
-            )
+            env = os.environ.copy()
+            env["PYTHONUNBUFFERED"] = "1"
+
+            sub_kwargs = {
+                "cwd": workspace_dir,
+                "capture_output": True,
+                "timeout": self.TIMEOUT_SECONDS,
+                "env": env,
+            }
+            if sys.platform != "win32":
+                sub_kwargs["preexec_fn"] = self._set_memory_limit
+
+            result = subprocess.run(command, **sub_kwargs)
+            exit_code = result.returncode
+            if exit_code < 0 or exit_code == 137:
+                memory_exceeded = True
+
             stdout = result.stdout.decode("utf-8", errors="replace")
             stderr = result.stderr.decode("utf-8", errors="replace")
-            return result.returncode, stdout, stderr, False
+
+            if len(result.stdout) + len(result.stderr) > self.MAX_OUTPUT_BYTES:
+                output_exceeded = True
+                stderr += "\nExecution stopped: Output limit or infinite print loop detected.\n"
+
+            return exit_code, stdout, stderr, False, memory_exceeded, output_exceeded
         except subprocess.TimeoutExpired as e:
             stdout = e.stdout.decode("utf-8", errors="replace") if e.stdout else ""
             stderr = (e.stderr.decode("utf-8", errors="replace") if e.stderr else "") + f"\nExecution stopped after {self.TIMEOUT_SECONDS} seconds.\n"
-            return 1, stdout, stderr, True
+            return 1, stdout, stderr, True, False, False
         except Exception as e:
-            return 1, "", str(e), False
+            return 1, "", str(e), False, False, False
 
     def _write_project_files(
             self,
@@ -161,9 +259,6 @@ class ExecutionService:
             files,
             standard_input: str,
     ):
-        workspace_path = PurePosixPath(workspace_dir)
-        print(f"DEBUG: Received files payload -> {[getattr(f, 'path', str(f)) for f in files]}")
-
         for source_file in files:
             safe_path = self._safe_file_path(source_file.path)
             file_path = os.path.join(workspace_dir, os.path.basename(str(safe_path)))
@@ -176,19 +271,26 @@ class ExecutionService:
             f.write(standard_input)
 
     def _build_execution_command(
-        self,
-        language: str,
-        entrypoint: str,
+            self,
+            language: str,
+            entrypoint: str,
     ):
         if language == "python":
-            return ["python", "-B", entrypoint]
+            return ["python", "-u", "-B", entrypoint]
 
         if language == "java":
-            return [
-                "sh",
-                "-c",
-                f"javac *.java && java {entrypoint} < {self.INPUT_FILE_NAME}",
-            ]
+            if sys.platform == "win32":
+                return [
+                    "cmd.exe",
+                    "/c",
+                    f"javac *.java && java {entrypoint} < {self.INPUT_FILE_NAME}",
+                ]
+            else:
+                return [
+                    "sh",
+                    "-c",
+                    f"javac *.java && java {entrypoint} < {self.INPUT_FILE_NAME}",
+                ]
 
         raise ExecutionError(f"Unsupported execution language: {language}")
 
