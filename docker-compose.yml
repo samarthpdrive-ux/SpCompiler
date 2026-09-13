@@ -1,0 +1,14 @@
+version: "3.8"
+
+services:
+  spcompiler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: spcompiler:latest
+    container_name: polyworkspace-backend
+    ports:
+      - "8001:8001"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: always
