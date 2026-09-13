@@ -2,12 +2,8 @@ import asyncio
 import shutil
 import tempfile
 import uuid
-import tarfile
-import io
-from pathlib import Path, PurePosixPath
-import os
+from pathlib import PurePosixPath
 
-import docker
 from fastapi import WebSocket, WebSocketDisconnect
 
 from app.models import RunRequest
@@ -39,12 +35,7 @@ class InteractiveTerminalService:
             request.language,
         )
 
-        container_name = (
-            f"polyworkspace-terminal-{uuid.uuid4().hex}"
-        )
-
-        client = docker.from_env()
-        container = None
+        workspace_dir = tempfile.mkdtemp(prefix="polyworkspace-term-")
         process = None
         output_task = None
         input_task = None
@@ -54,50 +45,12 @@ class InteractiveTerminalService:
         timed_out = False
 
         try:
-            print(f"DEBUG TERMINAL: Received request.files -> {request.files}")
-            print(f"DEBUG TERMINAL: Entrypoint requested -> {request.entrypoint}")
-
-            if not request.files:
-                print("WARNING: request.files is empty! The frontend sent no files.")
-
-            # Create container with interactive TTY enabled so input streams hook up properly
-            container = client.containers.create(
-                image=runner.image,
-                name=container_name,
-                working_dir="/workspace",
-                environment={
-                    runner.environment_name: entrypoint,
-                    "PYTHONDONTWRITEBYTECODE": "1",
-                },
-                network_disabled=True,
-                read_only=False,
-                tmpfs={
-                    "/tmp": "rw,noexec,nosuid,size=64m",
-                },
-                mem_limit="512m",
-                memswap_limit="512m",
-                nano_cpus=1_000_000_000,
-                pids_limit=64,
-                cap_drop=["ALL"],
-                security_opt=["no-new-privileges"],
-                user="runner",
-                stdin_open=True,
-                tty=True,
-            )
-
-            archive = self._create_project_archive(request.files, request.stdin)
-            container.put_archive(path="/workspace", data=archive)
-
-            command = [
-                "docker",
-                "start",
-                "--attach",
-                "--interactive",
-                container_name,
-            ]
+            self._write_project_files(workspace_dir, request.files, request.stdin)
+            command = self._build_execution_command(request.language, entrypoint)
 
             process = await asyncio.create_subprocess_exec(
                 *command,
+                cwd=workspace_dir,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
@@ -160,9 +113,8 @@ class InteractiveTerminalService:
                         }
                     )
 
-                    await self._stop_container(
-                        container_name
-                    )
+                    if process.returncode is None:
+                        process.kill()
 
                     exit_code = await wait_task
                     break
@@ -191,9 +143,8 @@ class InteractiveTerminalService:
                             )
 
                     if message.get("type") == "stop":
-                        await self._stop_container(
-                            container_name,
-                        )
+                        if process.returncode is None:
+                            process.kill()
 
                     input_task = asyncio.create_task(
                         websocket.receive_json()
@@ -202,10 +153,9 @@ class InteractiveTerminalService:
         except WebSocketDisconnect:
             raise
 
-        except FileNotFoundError as error:
+        except Exception as error:
             raise ExecutionError(
-                "Docker command was not found. "
-                "Start Docker Desktop and try again."
+                "System runtime command was not found."
             ) from error
 
         finally:
@@ -216,16 +166,14 @@ class InteractiveTerminalService:
                 timeout_task.cancel()
 
             if process is not None and process.returncode is None:
-                await self._stop_container(container_name)
-
+                process.kill()
                 try:
                     await asyncio.wait_for(
                         process.wait(),
                         timeout=5,
                     )
                 except asyncio.TimeoutError:
-                    process.kill()
-                    await process.wait()
+                    pass
 
             if output_task is not None:
                 try:
@@ -235,6 +183,11 @@ class InteractiveTerminalService:
 
             if wait_task is not None and wait_task.done():
                 exit_code = wait_task.result()
+
+            try:
+                shutil.rmtree(workspace_dir, ignore_errors=True)
+            except Exception:
+                pass
 
             try:
                 await websocket.send_json(
@@ -290,67 +243,42 @@ class InteractiveTerminalService:
 
         await process.stdin.drain()
 
-    async def _stop_container(
+    def _write_project_files(
         self,
-        container_name: str,
-    ):
-        cleanup_process = await asyncio.create_subprocess_exec(
-            "docker",
-            "rm",
-            "--force",
-            container_name,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-
-        try:
-            await asyncio.wait_for(
-                cleanup_process.wait(),
-                timeout=5,
-            )
-        except asyncio.TimeoutError:
-            cleanup_process.kill()
-            await cleanup_process.wait()
-
-    def _create_project_archive(
-        self,
+        workspace_dir: str,
         files,
         standard_input: str,
     ):
-        archive_buffer = io.BytesIO()
+        import os
+        workspace_path = PurePosixPath(workspace_dir)
 
-        with tarfile.open(fileobj=archive_buffer, mode="w") as archive:
-            for source_file in files:
-                safe_path = self._safe_file_path(source_file.path)
-                content = source_file.content.encode("utf-8")
+        for source_file in files:
+            safe_path = self._safe_file_path(source_file.path)
+            file_path = os.path.join(workspace_dir, os.path.basename(str(safe_path)))
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(source_file.content)
 
-                file_info = tarfile.TarInfo(
-                    name=os.path.basename(str(safe_path))
-                )
-                file_info.size = len(content)
-                file_info.mode = 0o644
+        input_path = os.path.join(workspace_dir, self.RESERVED_FILE_NAME)
+        with open(input_path, "w", encoding="utf-8") as f:
+            f.write(standard_input)
 
-                archive.addfile(
-                    tarinfo=file_info,
-                    fileobj=io.BytesIO(content),
-                )
-                print(f"DEBUG TERMINAL: Successfully archived file -> {source_file.path} (content length: {len(content)})")
+    def _build_execution_command(
+        self,
+        language: str,
+        entrypoint: str,
+    ):
+        if language == "python":
+            return ["python", "-B", entrypoint]
 
-            input_content = standard_input.encode("utf-8")
+        if language == "java":
+            return [
+                "sh",
+                "-c",
+                f"javac *.java && java {entrypoint} < {self.RESERVED_FILE_NAME}",
+            ]
 
-            input_info = tarfile.TarInfo(
-                name=self.RESERVED_FILE_NAME
-            )
-            input_info.size = len(input_content)
-            input_info.mode = 0o644
-
-            archive.addfile(
-                tarinfo=input_info,
-                fileobj=io.BytesIO(input_content),
-            )
-
-        archive_buffer.seek(0)
-        return archive_buffer.getvalue()
+        raise ExecutionError(f"Unsupported execution language: {language}")
 
     def _safe_file_path(
         self,
