@@ -1,63 +1,27 @@
-import io
-import tarfile
-import time
+import asyncio
+import shutil
+import tempfile
 import uuid
-from dataclasses import dataclass
-from pathlib import PurePosixPath
-import os
+from pathlib import Path, PurePosixPath
 
-import docker
-from docker.errors import DockerException
+from fastapi import WebSocket, WebSocketDisconnect
 
-from app.models import RunRequest, RunResponse
-
-
-class ExecutionError(Exception):
-    """Raised when a project cannot be prepared or executed."""
+from app.models import RunRequest
+from app.services.execution_service import (
+    ExecutionError,
+    RUNNERS,
+)
 
 
-@dataclass(frozen=True)
-class RunnerSpec:
-    image: str
-    default_entrypoint: str
-    environment_name: str
+class InteractiveTerminalService:
+    TIMEOUT_SECONDS = 60
+    RESERVED_FILE_NAME = ".polyworkspace-stdin"
 
-
-RUNNERS = {
-    "python": RunnerSpec(
-        image="polyworkspace-python-runner:0.1",
-        default_entrypoint="main.py",
-        environment_name="ENTRYPOINT",
-    ),
-    "java": RunnerSpec(
-        image="polyworkspace-java-runner:0.1",
-        default_entrypoint="Main",
-        environment_name="JAVA_MAIN_CLASS",
-    ),
-}
-
-
-class ExecutionService:
-    TIMEOUT_SECONDS = 10
-    INPUT_FILE_NAME = ".polyworkspace-stdin"
-
-    def __init__(self):
-        try:
-            docker_host = os.environ.get("DOCKER_HOST")
-            if docker_host:
-                self.client = docker.DockerClient(base_url=docker_host)
-            else:
-                self.client = docker.from_env()
-        except DockerException as error:
-            raise ExecutionError(
-                "Docker is not running or cannot be reached. Ensure the Docker socket is properly mounted."
-            ) from error
-
-    def health_check(self):
-        self.client.ping()
-        return {"docker": "connected"}
-
-    def run(self, request: RunRequest):
+    async def run(
+        self,
+        websocket: WebSocket,
+        request: RunRequest,
+    ):
         runner = RUNNERS.get(request.language)
 
         if runner is None:
@@ -66,163 +30,274 @@ class ExecutionService:
             )
 
         entrypoint = request.entrypoint or runner.default_entrypoint
-        self._validate_entrypoint(entrypoint, request.language)
+        self._validate_entrypoint(
+            entrypoint,
+            request.language,
+        )
 
-        container = None
-        started_at = time.perf_counter()
+        workspace_dir = tempfile.mkdtemp(prefix="polyworkspace-")
+        process = None
+        output_task = None
+        input_task = None
+        wait_task = None
+        timeout_task = None
+        exit_code = 1
         timed_out = False
 
         try:
-            container = self.client.containers.create(
-                image=runner.image,
-                name=f"polyworkspace-run-{uuid.uuid4().hex}",
-                working_dir="/workspace",
-                environment={
-                    runner.environment_name: entrypoint,
-                    "PYTHONDONTWRITEBYTECODE": "1",
-                },
-                network_disabled=True,
-                read_only=False,
-                tmpfs={
-                    "/tmp": "rw,noexec,nosuid,size=64m",
-                },
-                mem_limit="512m",
-                memswap_limit="512m",
-                nano_cpus=1_000_000_000,
-                pids_limit=64,
-                cap_drop=["ALL"],
-                security_opt=["no-new-privileges"],
-                user="runner",
+            print(f"DEBUG TERMINAL: Received request.files -> {request.files}")
+            print(f"DEBUG TERMINAL: Entrypoint requested -> {entrypoint}")
+
+            if not request.files:
+                print("WARNING: request.files is empty! The frontend sent no files.")
+
+            self._write_project_files(workspace_dir, request.files, request.stdin)
+
+            command = self._build_execution_command(request.language, entrypoint)
+
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                cwd=workspace_dir,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
             )
 
-            archive = self._create_project_archive(
-                files=request.files,
-                standard_input=request.stdin,
+            await websocket.send_json(
+                {
+                    "type": "started",
+                    "language": request.language,
+                    "message": (
+                        "Program started. Type in the terminal "
+                        "when the program asks for input."
+                    ),
+                }
             )
 
-            success = container.put_archive(
-                path="/workspace",
-                data=archive,
-            )
-
-            if not success:
-                raise ExecutionError(
-                    "Could not copy project files into runner container."
+            output_task = asyncio.create_task(
+                self._stream_output(
+                    websocket,
+                    process.stdout,
                 )
+            )
 
-            container.start()
+            input_task = asyncio.create_task(
+                websocket.receive_json()
+            )
 
-            deadline = time.monotonic() + self.TIMEOUT_SECONDS
+            wait_task = asyncio.create_task(
+                process.wait()
+            )
+
+            timeout_task = asyncio.create_task(
+                asyncio.sleep(self.TIMEOUT_SECONDS)
+            )
 
             while True:
-                container.reload()
-
-                if container.status in {"exited", "dead"}:
-                    break
-
-                if time.monotonic() >= deadline:
-                    timed_out = True
-                    container.kill()
-                    break
-
-                time.sleep(0.1)
-
-            result = container.wait()
-            exit_code = int(result.get("StatusCode", 1))
-
-            stdout = container.logs(
-                stdout=True,
-                stderr=False,
-            ).decode("utf-8", errors="replace")
-
-            stderr = container.logs(
-                stdout=False,
-                stderr=True,
-            ).decode("utf-8", errors="replace")
-
-            duration_ms = int(
-                (time.perf_counter() - started_at) * 1000
-            )
-
-            if timed_out:
-                stderr += (
-                    f"\nExecution stopped after "
-                    f"{self.TIMEOUT_SECONDS} seconds.\n"
+                completed_tasks, _ = await asyncio.wait(
+                    {
+                        input_task,
+                        wait_task,
+                        timeout_task,
+                    },
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
 
-            return RunResponse(
-                success=exit_code == 0 and not timed_out,
-                exit_code=exit_code,
-                stdout=stdout,
-                stderr=stderr,
-                duration_ms=duration_ms,
-                timed_out=timed_out,
-            )
+                if wait_task in completed_tasks:
+                    exit_code = wait_task.result()
+                    break
 
-        except DockerException as error:
+                if timeout_task in completed_tasks:
+                    timed_out = True
+
+                    await websocket.send_json(
+                        {
+                            "type": "output",
+                            "data": (
+                                f"\nExecution stopped after "
+                                f"{self.TIMEOUT_SECONDS} seconds.\n"
+                            ),
+                        }
+                    )
+
+                    if process.returncode is None:
+                        process.kill()
+
+                    exit_code = await wait_task
+                    break
+
+                if input_task in completed_tasks:
+                    message = input_task.result()
+
+                    if message.get("type") == "input":
+                        user_input = str(
+                            message.get("data", "")
+                        )
+
+                        if len(user_input) > 65_536:
+                            await websocket.send_json(
+                                {
+                                    "type": "error",
+                                    "message": (
+                                        "Terminal input is too long."
+                                    ),
+                                }
+                            )
+                        else:
+                            await self._send_input(
+                                process,
+                                user_input,
+                            )
+
+                    if message.get("type") == "stop":
+                        if process.returncode is None:
+                            process.kill()
+
+                    input_task = asyncio.create_task(
+                        websocket.receive_json()
+                    )
+
+        except WebSocketDisconnect:
+            raise
+
+        except FileNotFoundError as error:
             raise ExecutionError(
-                f"Docker execution failed: {error}"
+                "System runtime command was not found."
             ) from error
 
         finally:
-            if container is not None:
+            if input_task is not None:
+                input_task.cancel()
+
+            if timeout_task is not None:
+                timeout_task.cancel()
+
+            if process is not None and process.returncode is None:
+                process.kill()
                 try:
-                    container.remove(force=True)
-                except DockerException:
+                    await asyncio.wait_for(
+                        process.wait(),
+                        timeout=5,
+                    )
+                except asyncio.TimeoutError:
                     pass
 
-    def _create_project_archive(
-            self,
-            files,
-            standard_input: str,
+            if output_task is not None:
+                try:
+                    await output_task
+                except WebSocketDisconnect:
+                    pass
+
+            if wait_task is not None and wait_task.done():
+                exit_code = wait_task.result()
+
+            try:
+                shutil.rmtree(workspace_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+            try:
+                await websocket.send_json(
+                    {
+                        "type": "exit",
+                        "exit_code": exit_code,
+                        "success": exit_code == 0 and not timed_out,
+                        "timed_out": timed_out,
+                    }
+                )
+            except WebSocketDisconnect:
+                pass
+
+    async def _stream_output(
+        self,
+        websocket: WebSocket,
+        stdout,
     ):
-        archive_buffer = io.BytesIO()
+        if stdout is None:
+            return
 
-        # Debug print to verify what files are coming from the frontend payload
-        print(f"DEBUG: Received files payload -> {[getattr(f, 'path', str(f)) for f in files]}")
+        while True:
+            output_chunk = await stdout.read(1024)
 
-        with tarfile.open(fileobj=archive_buffer, mode="w") as archive:
-            for source_file in files:
-                safe_path = self._safe_file_path(source_file.path)
-                content = source_file.content.encode("utf-8")
+            if not output_chunk:
+                break
 
-                file_info = tarfile.TarInfo(
-                    name=os.path.basename(str(safe_path))
-                )
-                file_info.size = len(content)
-                file_info.mode = 0o644
-
-                archive.addfile(
-                    tarinfo=file_info,
-                    fileobj=io.BytesIO(content),
-                )
-
-            input_content = standard_input.encode("utf-8")
-
-            input_info = tarfile.TarInfo(
-                name=self.INPUT_FILE_NAME
-            )
-            input_info.size = len(input_content)
-            input_info.mode = 0o644
-
-            archive.addfile(
-                tarinfo=input_info,
-                fileobj=io.BytesIO(input_content),
+            output_text = output_chunk.decode(
+                "utf-8",
+                errors="replace",
             )
 
-        archive_buffer.seek(0)
-        return archive_buffer.getvalue()
+            await websocket.send_json(
+                {
+                    "type": "output",
+                    "data": output_text,
+                }
+            )
 
-    def _safe_file_path(self, raw_path: str):
+    async def _send_input(
+        self,
+        process,
+        user_input: str,
+    ):
+        if process.stdin is None:
+            raise ExecutionError(
+                "The terminal input stream is unavailable."
+            )
+
+        process.stdin.write(
+            f"{user_input}\n".encode("utf-8")
+        )
+
+        await process.stdin.drain()
+
+    def _write_project_files(
+        self,
+        workspace_dir: str,
+        files,
+        standard_input: str,
+    ):
+        workspace_path = Path(workspace_dir)
+
+        for source_file in files:
+            safe_path = self._safe_file_path(source_file.path)
+            file_path = workspace_path / safe_path.name
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.write_text(source_file.content, encoding="utf-8")
+            print(f"DEBUG TERMINAL: Successfully wrote file -> {source_file.path} (content length: {len(source_file.content)})")
+
+        input_path = workspace_path / self.RESERVED_FILE_NAME
+        input_path.write_text(standard_input, encoding="utf-8")
+
+    def _build_execution_command(
+        self,
+        language: str,
+        entrypoint: str,
+    ):
+        if language == "python":
+            return ["python", "-B", entrypoint]
+
+        if language == "java":
+            return [
+                "sh",
+                "-c",
+                f"javac *.java && java {entrypoint}",
+            ]
+
+        raise ExecutionError(f"Unsupported execution language: {language}")
+
+    def _safe_file_path(
+        self,
+        raw_path: str,
+    ):
         normalized = raw_path.replace("\\", "/")
         path = PurePosixPath(normalized)
 
         if (
-                path.is_absolute()
-                or ".." in path.parts
-                or ":" in normalized
-                or str(path) in {"", "."}
-                or str(path) == self.INPUT_FILE_NAME
+            path.is_absolute()
+            or ".." in path.parts
+            or ":" in normalized
+            or str(path) in {"", "."}
+            or str(path) == self.RESERVED_FILE_NAME
         ):
             raise ExecutionError(
                 f"Unsafe or reserved file path: {raw_path}"
@@ -231,9 +306,9 @@ class ExecutionService:
         return path
 
     def _validate_entrypoint(
-            self,
-            entrypoint: str,
-            language: str,
+        self,
+        entrypoint: str,
+        language: str,
     ):
         if language == "python":
             self._safe_file_path(entrypoint)
