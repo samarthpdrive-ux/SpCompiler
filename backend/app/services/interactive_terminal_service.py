@@ -1,8 +1,9 @@
 import asyncio
 import shutil
 import tempfile
-import uuid
-from pathlib import PurePosixPath
+import sys
+import os
+from pathlib import Path, PurePosixPath
 
 from fastapi import WebSocket, WebSocketDisconnect
 
@@ -15,6 +16,7 @@ from app.services.execution_service import (
 
 class InteractiveTerminalService:
     TIMEOUT_SECONDS = 60
+    MAX_OUTPUT_BYTES = 1 * 1024 * 1024  # 1 MB max output limit
     RESERVED_FILE_NAME = ".polyworkspace-stdin"
 
     async def run(
@@ -35,7 +37,7 @@ class InteractiveTerminalService:
             request.language,
         )
 
-        workspace_dir = tempfile.mkdtemp(prefix="polyworkspace-term-")
+        workspace_dir = tempfile.mkdtemp(prefix="polyworkspace-")
         process = None
         output_task = None
         input_task = None
@@ -43,10 +45,16 @@ class InteractiveTerminalService:
         timeout_task = None
         exit_code = 1
         timed_out = False
+        output_exceeded = False
 
         try:
             self._write_project_files(workspace_dir, request.files, request.stdin)
+
             command = self._build_execution_command(request.language, entrypoint)
+
+            # Ensure real-time unbuffered output piping across all OS platforms
+            env = os.environ.copy()
+            env["PYTHONUNBUFFERED"] = "1"
 
             process = await asyncio.create_subprocess_exec(
                 *command,
@@ -54,6 +62,7 @@ class InteractiveTerminalService:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                env=env,
             )
 
             await websocket.send_json(
@@ -70,7 +79,7 @@ class InteractiveTerminalService:
             output_task = asyncio.create_task(
                 self._stream_output(
                     websocket,
-                    process.stdout,
+                    process,
                 )
             )
 
@@ -153,7 +162,7 @@ class InteractiveTerminalService:
         except WebSocketDisconnect:
             raise
 
-        except Exception as error:
+        except FileNotFoundError as error:
             raise ExecutionError(
                 "System runtime command was not found."
             ) from error
@@ -194,7 +203,7 @@ class InteractiveTerminalService:
                     {
                         "type": "exit",
                         "exit_code": exit_code,
-                        "success": exit_code == 0 and not timed_out,
+                        "success": exit_code == 0 and not timed_out and not output_exceeded,
                         "timed_out": timed_out,
                     }
                 )
@@ -204,28 +213,57 @@ class InteractiveTerminalService:
     async def _stream_output(
         self,
         websocket: WebSocket,
-        stdout,
+        process,
     ):
+        stdout = process.stdout
         if stdout is None:
             return
 
-        while True:
-            output_chunk = await stdout.read(1024)
+        recent_chunks = []
+        max_repeats = 15
+        total_bytes = 0
 
-            if not output_chunk:
-                break
+        try:
+            while True:
+                chunk = await stdout.read(256)  # Smaller read buffer for faster real-time flushing
+                if not chunk:
+                    break
 
-            output_text = output_chunk.decode(
-                "utf-8",
-                errors="replace",
-            )
+                total_bytes += len(chunk)
+                if total_bytes > self.MAX_OUTPUT_BYTES:
+                    await websocket.send_json(
+                        {
+                            "type": "output",
+                            "data": "\n[GUARDRAIL]: Output limit exceeded (1 MB max).\n",
+                        }
+                    )
+                    if process.returncode is None:
+                        process.kill()
+                    break
 
-            await websocket.send_json(
-                {
-                    "type": "output",
-                    "data": output_text,
-                }
-            )
+                chunk_str = chunk.decode("utf-8", errors="replace")
+                recent_chunks.append(chunk_str)
+                if len(recent_chunks) > max_repeats:
+                    recent_chunks.pop(0)
+                    if len(set(recent_chunks)) == 1 and len(chunk_str.strip()) > 0:
+                        await websocket.send_json(
+                            {
+                                "type": "output",
+                                "data": "\n[GUARDRAIL]: Infinite repeating print loop detected.\n",
+                            }
+                        )
+                        if process.returncode is None:
+                            process.kill()
+                        break
+
+                await websocket.send_json(
+                    {
+                        "type": "output",
+                        "data": chunk_str,
+                    }
+                )
+        except Exception:
+            pass
 
     async def _send_input(
         self,
@@ -249,19 +287,16 @@ class InteractiveTerminalService:
         files,
         standard_input: str,
     ):
-        import os
-        workspace_path = PurePosixPath(workspace_dir)
+        workspace_path = Path(workspace_dir)
 
         for source_file in files:
             safe_path = self._safe_file_path(source_file.path)
-            file_path = os.path.join(workspace_dir, os.path.basename(str(safe_path)))
-            os.makedirs(os.path.dirname(file_path), exist_ok=True)
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(source_file.content)
+            file_path = workspace_path / safe_path.name
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.write_text(source_file.content, encoding="utf-8")
 
-        input_path = os.path.join(workspace_dir, self.RESERVED_FILE_NAME)
-        with open(input_path, "w", encoding="utf-8") as f:
-            f.write(standard_input)
+        input_path = workspace_path / self.RESERVED_FILE_NAME
+        input_path.write_text(standard_input, encoding="utf-8")
 
     def _build_execution_command(
         self,
@@ -269,14 +304,21 @@ class InteractiveTerminalService:
         entrypoint: str,
     ):
         if language == "python":
-            return ["python", "-B", entrypoint]
+            return ["python", "-u", "-B", entrypoint]
 
         if language == "java":
-            return [
-                "sh",
-                "-c",
-                f"javac *.java && java {entrypoint} < {self.RESERVED_FILE_NAME}",
-            ]
+            if sys.platform == "win32":
+                return [
+                    "cmd.exe",
+                    "/c",
+                    f"javac *.java && java {entrypoint} < {self.RESERVED_FILE_NAME}",
+                ]
+            else:
+                return [
+                    "sh",
+                    "-c",
+                    f"javac *.java && java {entrypoint} < {self.RESERVED_FILE_NAME}",
+                ]
 
         raise ExecutionError(f"Unsupported execution language: {language}")
 
