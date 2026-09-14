@@ -6,9 +6,9 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 import os
 import sys
-
-if sys.platform != "win32":
-    import resource
+import shlex
+import re
+from pathlib import Path
 
 from app.models import RunRequest, RunResponse
 
@@ -28,6 +28,12 @@ RUNNERS = {
     ),
     "java": RunnerSpec(
         default_entrypoint="Main",
+    ),
+    "javascript": RunnerSpec(
+        default_entrypoint="main.js",
+    ),
+    "cpp": RunnerSpec(
+        default_entrypoint="main.cpp",
     ),
 }
 
@@ -64,7 +70,11 @@ class ExecutionService:
                 standard_input=request.stdin,
             )
 
-            command = self._build_execution_command(request.language, entrypoint)
+            command = self._build_execution_command(
+                request.language,
+                entrypoint,
+                workspace_dir,
+            )
 
             try:
                 loop = asyncio.get_running_loop()
@@ -103,14 +113,6 @@ class ExecutionService:
         finally:
             shutil.rmtree(workspace_dir, ignore_errors=True)
 
-    def _set_memory_limit(self):
-        if sys.platform != "win32":
-            memory_limit_bytes = 256 * 1024 * 1024  # 256 MB RAM limit
-            try:
-                resource.setrlimit(resource.RLIMIT_AS, (memory_limit_bytes, memory_limit_bytes))
-            except (ValueError, resource.error):
-                pass
-
     async def _execute_async(self, command: list, workspace_dir: str):
         timed_out = False
         memory_exceeded = False
@@ -123,18 +125,24 @@ class ExecutionService:
 
         exec_kwargs = {
             "cwd": workspace_dir,
+            "stdin": asyncio.subprocess.PIPE,
             "stdout": asyncio.subprocess.PIPE,
             "stderr": asyncio.subprocess.PIPE,
             "env": env,
         }
 
-        if sys.platform != "win32":
-            exec_kwargs["preexec_fn"] = self._set_memory_limit
-
         process = await asyncio.create_subprocess_exec(
             *command,
             **exec_kwargs
         )
+
+        # The REST endpoint accepts initial standard input. The interactive
+        # endpoint instead keeps stdin open for terminal messages.
+        if process.stdin is not None:
+            input_data = Path(workspace_dir, self.INPUT_FILE_NAME).read_bytes()
+            process.stdin.write(input_data)
+            await process.stdin.drain()
+            process.stdin.close()
 
         start_time = time.monotonic()
         recent_chunks = []
@@ -200,16 +208,12 @@ class ExecutionService:
                 pass
 
         exit_code = process.returncode if process.returncode is not None else 1
-        if exit_code < 0 or exit_code == 137:
-            memory_exceeded = True
 
         stdout = bytes(stdout_data).decode("utf-8", errors="replace")
         stderr = bytes(stderr_data).decode("utf-8", errors="replace")
 
         if output_exceeded:
             stderr += "\nExecution stopped: Output limit or infinite print loop detected.\n"
-        if memory_exceeded:
-            stderr += "\nExecution stopped: Memory limit exceeded.\n"
         if timed_out:
             stderr += f"\nExecution stopped after {self.TIMEOUT_SECONDS} seconds.\n"
 
@@ -230,13 +234,9 @@ class ExecutionService:
                 "timeout": self.TIMEOUT_SECONDS,
                 "env": env,
             }
-            if sys.platform != "win32":
-                sub_kwargs["preexec_fn"] = self._set_memory_limit
 
             result = subprocess.run(command, **sub_kwargs)
             exit_code = result.returncode
-            if exit_code < 0 or exit_code == 137:
-                memory_exceeded = True
 
             stdout = result.stdout.decode("utf-8", errors="replace")
             stderr = result.stderr.decode("utf-8", errors="replace")
@@ -261,7 +261,9 @@ class ExecutionService:
     ):
         for source_file in files:
             safe_path = self._safe_file_path(source_file.path)
-            file_path = os.path.join(workspace_dir, os.path.basename(str(safe_path)))
+            # Keep the directory structure.  Flattening `src/utils.py` into
+            # `utils.py` prevents normal imports and makes data files vanish.
+            file_path = os.path.join(workspace_dir, *safe_path.parts)
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(source_file.content)
@@ -274,22 +276,57 @@ class ExecutionService:
             self,
             language: str,
             entrypoint: str,
+            workspace_dir: str,
     ):
         if language == "python":
-            return ["python", "-u", "-B", entrypoint]
+            # In development, this is the interpreter that runs the API.  It
+            # is more reliable than assuming that `python` is on PATH.
+            interpreter = (
+                os.environ.get("SPCOMPILER_PYTHON")
+                or ("python" if getattr(sys, "frozen", False) else sys.executable)
+            )
+            return [interpreter, "-u", "-B", entrypoint]
 
-        if language == "java":
+        if language == "javascript":
+            return ["node", entrypoint]
+
+        if language == "cpp":
+            executable = ".polyworkspace-program.exe" if sys.platform == "win32" else ".polyworkspace-program"
             if sys.platform == "win32":
                 return [
                     "cmd.exe",
                     "/c",
-                    f"javac *.java && java {entrypoint} < {self.INPUT_FILE_NAME}",
+                    f'g++ "{entrypoint}" -std=c++17 -O2 -o "{executable}" && "{executable}" < {self.INPUT_FILE_NAME}',
+                ]
+            return [
+                "sh",
+                "-c",
+                f"g++ {shlex.quote(entrypoint)} -std=c++17 -O2 -o {shlex.quote(executable)} && ./{shlex.quote(executable)} < {shlex.quote(self.INPUT_FILE_NAME)}",
+            ]
+
+        if language == "java":
+            java_files = []
+            for root, _, names in os.walk(workspace_dir):
+                for name in names:
+                    if name.endswith(".java"):
+                        java_files.append(os.path.relpath(os.path.join(root, name), workspace_dir))
+
+            if not java_files:
+                raise ExecutionError("No Java source files were provided.")
+
+            if sys.platform == "win32":
+                sources = " ".join(f'"{path}"' for path in java_files)
+                return [
+                    "cmd.exe",
+                    "/c",
+                    f"javac -d . {sources} && java {entrypoint} < {self.INPUT_FILE_NAME}",
                 ]
             else:
+                sources = " ".join(shlex.quote(path) for path in java_files)
                 return [
                     "sh",
                     "-c",
-                    f"javac *.java && java {entrypoint} < {self.INPUT_FILE_NAME}",
+                    f"javac -d . {sources} && java {shlex.quote(entrypoint)} < {shlex.quote(self.INPUT_FILE_NAME)}",
                 ]
 
         raise ExecutionError(f"Unsupported execution language: {language}")
@@ -304,6 +341,12 @@ class ExecutionService:
                 or ":" in normalized
                 or str(path) in {"", "."}
                 or str(path) == self.INPUT_FILE_NAME
+                # C++ and Java use a shell for compiler redirection. Keep
+                # filenames shell-safe as well as traversal-safe.
+                or re.fullmatch(
+                    r"[A-Za-z0-9][A-Za-z0-9._ -]*(/[A-Za-z0-9][A-Za-z0-9._ -]*)*",
+                    normalized,
+                ) is None
         ):
             raise ExecutionError(
                 f"Unsafe or reserved file path: {raw_path}"
@@ -316,7 +359,7 @@ class ExecutionService:
             entrypoint: str,
             language: str,
     ):
-        if language == "python":
+        if language in {"python", "javascript", "cpp"}:
             self._safe_file_path(entrypoint)
 
         if language == "java":
