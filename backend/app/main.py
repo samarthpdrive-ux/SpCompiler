@@ -203,6 +203,26 @@ def save_file(data: FileSaveRequest):
     return {"status": "saved", "file_path": data.file_path, "path": full_file_path}
 
 
+@app.delete("/api/files")
+def delete_file(project_name: str, file_path: str):
+    """Delete one project file, never a directory or a path outside the workspace."""
+    project_path = get_project_path(project_name)
+    full_file_path = get_file_path(project_path, file_path)
+
+    if not os.path.isfile(full_file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+
+    try:
+        os.remove(full_file_path)
+    except OSError as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not delete the file: {error}",
+        ) from error
+
+    return {"status": "deleted", "file_path": file_path}
+
+
 @app.get("/api/files/read")
 def read_file(project_name: str, file_path: str):
     project_path = get_project_path(project_name)
