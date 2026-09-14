@@ -11,8 +11,6 @@ const TERMINAL_URL = `${
   window.location.protocol === "https:" ? "wss:" : "ws:"
 }//${window.location.host}/api/terminal`;
 
-const WORKSPACE_STORAGE_KEY = "polyworkspace.workspace.v6";
-
 const languageCards = [
   {
     id: "python",
@@ -35,16 +33,16 @@ const languageCards = [
     name: "JavaScript",
     icon: "JS",
     category: "web",
-    enabled: false,
-    description: "Coming soon",
+    enabled: true,
+    description: "Run Node.js multi-file projects",
   },
   {
     id: "cpp",
     name: "C++",
     icon: "C++",
     category: "programming",
-    enabled: false,
-    description: "Coming soon",
+    enabled: true,
+    description: "Compile and run C++ files",
   },
   {
     id: "react",
@@ -73,6 +71,14 @@ function getLanguageFromPath(path) {
     return "java";
   }
 
+  if (path.endsWith(".js") || path.endsWith(".mjs") || path.endsWith(".cjs")) {
+    return "javascript";
+  }
+
+  if (path.endsWith(".cpp") || path.endsWith(".cc") || path.endsWith(".cxx")) {
+    return "cpp";
+  }
+
   return "plaintext";
 }
 
@@ -83,6 +89,14 @@ function getLanguageLabel(language) {
 
   if (language === "java") {
     return "Java";
+  }
+
+  if (language === "javascript") {
+    return "JavaScript";
+  }
+
+  if (language === "cpp") {
+    return "C++";
   }
 
   return "Unknown";
@@ -97,109 +111,90 @@ function getEntrypoint(language, files) {
     return mainFile ? mainFile.path : files[0].path;
   }
 
+  if (language === "javascript") {
+    const mainFile = files.find((file) =>
+      ["main.js", "index.js", "main.mjs"].includes(file.path),
+    );
+    return mainFile ? mainFile.path : files[0].path;
+  }
+
+  if (language === "cpp") {
+    const mainFile = files.find((file) =>
+      ["main.cpp", "main.cc", "main.cxx"].includes(file.path),
+    );
+    return mainFile ? mainFile.path : files[0].path;
+  }
+
   const mainFile = files.find(
     (file) => file.path === "Main.java",
   );
 
-  if (mainFile) {
-    return "Main";
-  }
-
-  return files[0].path
+  const javaFile = mainFile || files[0];
+  const className = javaFile.path
     .split("/")
     .pop()
-    .replace(".java", "");
+    .replace(/\.java$/i, "");
+  const packageMatch = javaFile.content.match(
+    /^\s*package\s+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*;/m,
+  );
+
+  return packageMatch ? `${packageMatch[1]}.${className}` : className;
 }
 
-function loadSavedWorkspace() {
-  try {
-    const savedValue = localStorage.getItem(
-      WORKSPACE_STORAGE_KEY,
-    );
-
-    if (!savedValue) {
-      return null;
-    }
-
-    return JSON.parse(savedValue);
-  } catch {
-    return null;
+function getWorkspaceLabel(directory) {
+  if (!directory) {
+    return "Workspace";
   }
+
+  return directory.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || "Workspace";
 }
 
 export default function App() {
-  const [savedWorkspace] = useState(loadSavedWorkspace);
-
-  const [screen, setScreen] = useState(
-    savedWorkspace?.screen || "home",
-  );
+  const [screen, setScreen] = useState("home");
 
   const [query, setQuery] = useState("");
   const [category, setCategory] = useState("popular");
 
-  const [files, setFiles] = useState(
-    Array.isArray(savedWorkspace?.files)
-      ? savedWorkspace.files
-      : [],
+  const [projectName, setProjectName] = useState("");
+  const [files, setFiles] = useState([]);
+  const [workspaceDirectory, setWorkspaceDirectory] = useState("");
+  const [workspaceSelected, setWorkspaceSelected] = useState(false);
+  const [autoSaveEnabled, setAutoSaveEnabled] = useState(() =>
+    window.localStorage.getItem("spcompiler-autosave") !== "false",
   );
 
-  const [selectedPath, setSelectedPath] = useState(
-    savedWorkspace?.selectedPath || "",
-  );
+  const [selectedPath, setSelectedPath] = useState("");
 
-  const [rightTab, setRightTab] = useState(
-    savedWorkspace?.rightTab || "console",
-  );
+  const [rightTab, setRightTab] = useState("console");
+  const [leftPanel, setLeftPanel] = useState("files");
 
-  const [leftPanel, setLeftPanel] = useState(
-    savedWorkspace?.leftPanel || "files",
-  );
+  const [explorerVisible, setExplorerVisible] = useState(true);
 
-  const [explorerVisible, setExplorerVisible] = useState(
-    savedWorkspace?.explorerVisible ?? true,
-  );
-
-  const [isConsoleOpen, setIsConsoleOpen] = useState(
-    savedWorkspace?.isConsoleOpen ?? false,
-  );
-
-  const [consoleHeight, setConsoleHeight] = useState(
-    savedWorkspace?.consoleHeight || 220,
-  );
+  const [isConsoleOpen, setIsConsoleOpen] = useState(false);
+  const [consoleHeight, setConsoleHeight] = useState(220);
 
   const [fileSearchQuery, setFileSearchQuery] = useState("");
 
-  const [editorFontSize, setEditorFontSize] = useState(
-    savedWorkspace?.editorFontSize || 22,
-  );
+  const [editorFontSize, setEditorFontSize] = useState(22);
+  const [wordWrap, setWordWrap] = useState(true);
+  const [theme, setTheme] = useState("tokyo-night");
 
-  const [wordWrap, setWordWrap] = useState(
-    savedWorkspace?.wordWrap ?? true,
-  );
-
-  const [theme, setTheme] = useState(
-    savedWorkspace?.theme || "tokyo-night",
-  );
-
-  const [terminalOutput, setTerminalOutput] = useState(
-    savedWorkspace?.terminalOutput || "",
-  );
-
+  const [terminalOutput, setTerminalOutput] = useState("");
   const [terminalInput, setTerminalInput] = useState("");
   const [terminalState, setTerminalState] = useState("idle");
 
-  const [terminalLanguage, setTerminalLanguage] = useState(
-    savedWorkspace?.terminalLanguage || "",
-  );
+  const [terminalLanguage, setTerminalLanguage] = useState("");
 
   const [isDownloading, setIsDownloading] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [fileMenuOpen, setFileMenuOpen] = useState(false);
 
   const terminalSocketRef = useRef(null);
   const terminalInputRef = useRef(null);
   const terminalOutputRef = useRef(null);
   const runQueueRef = useRef([]);
   const appContainerRef = useRef(null);
+  const saveTimeoutRef = useRef(null);
 
   const selectedFile = files.find(
     (file) => file.path === selectedPath,
@@ -215,6 +210,14 @@ export default function App() {
 
   const javaFiles = files.filter(
     (file) => getLanguageFromPath(file.path) === "java",
+  );
+
+  const javascriptFiles = files.filter(
+    (file) => getLanguageFromPath(file.path) === "javascript",
+  );
+
+  const cppFiles = files.filter(
+    (file) => getLanguageFromPath(file.path) === "cpp",
   );
 
   const searchedFiles = files.filter((file) =>
@@ -241,43 +244,6 @@ export default function App() {
   const isTerminalActive =
     terminalState === "connecting" ||
     terminalState === "running";
-
-  useEffect(() => {
-    const workspaceData = {
-      screen,
-      files,
-      selectedPath,
-      rightTab,
-      leftPanel,
-      explorerVisible,
-      isConsoleOpen,
-      consoleHeight,
-      editorFontSize,
-      wordWrap,
-      theme,
-      terminalOutput: terminalOutput.slice(-10000),
-      terminalLanguage,
-    };
-
-    localStorage.setItem(
-      WORKSPACE_STORAGE_KEY,
-      JSON.stringify(workspaceData),
-    );
-  }, [
-    screen,
-    files,
-    selectedPath,
-    rightTab,
-    leftPanel,
-    explorerVisible,
-    isConsoleOpen,
-    consoleHeight,
-    editorFontSize,
-    wordWrap,
-    theme,
-    terminalOutput,
-    terminalLanguage,
-  ]);
 
   useEffect(() => {
     function handleFullscreenChange() {
@@ -324,32 +290,148 @@ export default function App() {
     };
   }, []);
 
-  function createProject(language) {
-    const entryFile = language === "python"
-      ? "main.py"
-      : "Main.java";
+  useEffect(() => {
+    fetch("/api/settings/workspace")
+      .then((response) => response.json())
+      .then((data) => {
+        setWorkspaceDirectory(data.workspace_dir || "");
+        setWorkspaceSelected(Boolean(data.is_configured));
+      })
+      .catch(() => {});
+  }, []);
 
-    setFiles([
-      {
-        path: entryFile,
-        content: "",
-      },
-    ]);
+  useEffect(() => {
+    window.localStorage.setItem(
+      "spcompiler-autosave",
+      String(autoSaveEnabled),
+    );
+  }, [autoSaveEnabled]);
 
-    setSelectedPath(entryFile);
-    setTerminalOutput("");
-    setTerminalInput("");
-    setTerminalState("idle");
-    setTerminalLanguage("");
-    setExplorerVisible(true);
-    setIsConsoleOpen(false);
-    setLeftPanel("files");
-    runQueueRef.current = [];
-    setScreen("workspace");
+  async function chooseWorkspaceDirectory() {
+    let directory = null;
+    const nativeChooser = window.pywebview?.api?.choose_workspace_directory;
+
+    try {
+      if (nativeChooser) {
+        directory = await nativeChooser();
+      } else {
+        directory = window.prompt(
+          "Enter an absolute folder path for permanent projects:",
+          workspaceDirectory || "C:\\SpCompilerProjects",
+        );
+      }
+
+      if (!directory) {
+        return null;
+      }
+
+      const response = await fetch("/api/settings/workspace", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ workspace_dir: directory }),
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.detail || "Could not set the workspace folder.");
+      }
+
+      setWorkspaceDirectory(data.workspace_dir);
+      setWorkspaceSelected(true);
+      return data.workspace_dir;
+    } catch (error) {
+      window.alert(`Could not set project folder: ${error.message}`);
+      return null;
+    }
   }
 
-  function openWorkspace() {
-    setScreen("workspace");
+  async function loadWorkspace(directory, languageToCreate = null) {
+    if (saveTimeoutRef.current) {
+      clearTimeout(saveTimeoutRef.current);
+      saveTimeoutRef.current = null;
+    }
+
+    try {
+      const response = await fetch(
+        "/api/projects/files?project_name=.",
+      );
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.detail || "Could not load this workspace.");
+      }
+
+      let workspaceFiles = data.files;
+      let selectedFilePath = workspaceFiles[0]?.path || "";
+
+      if (languageToCreate) {
+        const existingSource = workspaceFiles.find(
+          (file) => getLanguageFromPath(file.path) === languageToCreate,
+        );
+
+        if (existingSource) {
+          selectedFilePath = existingSource.path;
+        } else {
+          const entryFile = {
+            python: "main.py",
+            java: "Main.java",
+            javascript: "main.js",
+            cpp: "main.cpp",
+          }[languageToCreate];
+
+          const saveResponse = await fetch("/api/files/save", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              project_name: ".",
+              file_path: entryFile,
+              content: "",
+            }),
+          });
+          if (!saveResponse.ok) {
+            const error = await saveResponse.json().catch(() => ({}));
+            throw new Error(error.detail || "Could not create the entry file.");
+          }
+
+          workspaceFiles = [
+            ...workspaceFiles,
+            { path: entryFile, content: "" },
+          ];
+          selectedFilePath = entryFile;
+        }
+      }
+
+      setWorkspaceDirectory(directory);
+      setProjectName(".");
+      setFiles(workspaceFiles);
+      setSelectedPath(selectedFilePath);
+      setTerminalOutput("");
+      setTerminalInput("");
+      setTerminalState("idle");
+      setTerminalLanguage("");
+      setExplorerVisible(true);
+      setIsConsoleOpen(false);
+      setLeftPanel("files");
+      runQueueRef.current = [];
+      setScreen("workspace");
+    } catch (error) {
+      window.alert(`Could not open workspace: ${error.message}`);
+    }
+  }
+
+  async function createProject(language) {
+    const directory = workspaceSelected
+      ? workspaceDirectory
+      : await chooseWorkspaceDirectory();
+
+    if (directory) {
+      await loadWorkspace(directory, language);
+    }
+  }
+
+  async function openWorkspace() {
+    const directory = await chooseWorkspaceDirectory();
+    if (directory) {
+      await loadWorkspace(directory);
+    }
   }
 
   function selectLeftPanel(panelName) {
@@ -370,40 +452,50 @@ export default function App() {
     );
   }
 
-  function addFile() {
+  async function addFile() {
     const path = window.prompt(
-      "Enter a file name: main.py, helper.py, Main.java, Student.java",
+      "Enter relative file path (e.g. main.py, src/utils.py, Main.java):",
     );
 
     if (!path) {
       return;
     }
 
-    const language = getLanguageFromPath(path);
-
-    if (language !== "python" && language !== "java") {
-      window.alert(
-        "Currently, only .py and .java files are supported.",
-      );
-      return;
-    }
-
+    // Accept any valid file creation path without strict extension restriction or prompt alerts blocking folder paths
     if (files.some((file) => file.path === path)) {
-      window.alert("A file with that name already exists.");
+      window.alert("A file with that path already exists.");
       return;
     }
 
-    setFiles((currentFiles) => [
-      ...currentFiles,
-      {
-        path,
-        content: "",
-      },
-    ]);
+    try {
+      const saveResponse = await fetch("/api/files/save", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          project_name: projectName,
+          file_path: path,
+          content: "",
+        }),
+      });
+      if (!saveResponse.ok) {
+        const error = await saveResponse.json().catch(() => ({}));
+        throw new Error(error.detail || "The file path is invalid.");
+      }
 
-    setSelectedPath(path);
-    setExplorerVisible(true);
-    setLeftPanel("files");
+      setFiles((currentFiles) => [
+        ...currentFiles,
+        {
+          path,
+          content: "",
+        },
+      ]);
+
+      setSelectedPath(path);
+      setExplorerVisible(true);
+      setLeftPanel("files");
+    } catch (error) {
+      window.alert(`Could not create file: ${error.message}`);
+    }
   }
 
   function deleteSelectedFile() {
@@ -428,16 +520,121 @@ export default function App() {
   }
 
   function updateFileContent(content) {
+    const newContent = content || "";
+    const pathToSave = selectedPath;
+
     setFiles((currentFiles) =>
       currentFiles.map((file) =>
         file.path === selectedPath
           ? {
               ...file,
-              content: content || "",
+              content: newContent,
             }
           : file,
       ),
     );
+
+    if (!autoSaveEnabled) {
+      return;
+    }
+
+    if (saveTimeoutRef.current) {
+      clearTimeout(saveTimeoutRef.current);
+    }
+
+    saveTimeoutRef.current = setTimeout(async () => {
+      if (!projectName || !pathToSave) return;
+
+      try {
+        await fetch("/api/files/save", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            project_name: projectName,
+            file_path: pathToSave,
+            content: newContent,
+          }),
+        });
+      } catch (err) {
+        console.error("Autosave failed:", err);
+      }
+    }, 800);
+  }
+
+  async function saveSelectedFile() {
+    if (!projectName || !selectedFile) {
+      return;
+    }
+
+    try {
+      const response = await fetch("/api/files/save", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          project_name: projectName,
+          file_path: selectedFile.path,
+          content: selectedFile.content,
+        }),
+      });
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({}));
+        throw new Error(error.detail || "Could not save the file.");
+      }
+      appendTerminalOutput(`\n[Saved ${selectedFile.path}]\n`);
+    } catch (error) {
+      window.alert(`Save failed: ${error.message}`);
+    }
+  }
+
+  async function saveAllFiles() {
+    if (!projectName || files.length === 0) {
+      return;
+    }
+
+    try {
+      const responses = await Promise.all(
+        files.map((file) => fetch("/api/files/save", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            project_name: projectName,
+            file_path: file.path,
+            content: file.content,
+          }),
+        })),
+      );
+      if (responses.some((response) => !response.ok)) {
+        throw new Error("One or more files could not be saved.");
+      }
+      appendTerminalOutput(`\n[Saved all ${files.length} files]\n`);
+    } catch (error) {
+      window.alert(`Save all failed: ${error.message}`);
+    }
+  }
+
+  async function reloadWorkspace() {
+    if (!workspaceDirectory) {
+      return;
+    }
+
+    await loadWorkspace(workspaceDirectory);
+  }
+
+  function closeProject() {
+    if (!autoSaveEnabled && files.length > 0 && !window.confirm(
+      "Autosave is off. Close this project without saving unsaved changes?",
+    )) {
+      return;
+    }
+
+    terminalSocketRef.current?.close();
+    terminalSocketRef.current = null;
+    setProjectName("");
+    setFiles([]);
+    setSelectedPath("");
+    setTerminalOutput("");
+    setTerminalState("idle");
+    setScreen("home");
   }
 
   function appendTerminalOutput(text) {
@@ -509,7 +706,7 @@ export default function App() {
       const link = document.createElement("a");
 
       link.href = downloadUrl;
-      link.download = "polyworkspace-project.zip";
+      link.download = `${projectName || "polyworkspace-project"}.zip`;
 
       document.body.appendChild(link);
       link.click();
@@ -533,12 +730,12 @@ export default function App() {
     }
   }
 
-  function startInteractiveProject(language) {
-    const projectFiles = language === "python"
-      ? pythonFiles
-      : javaFiles;
+  function startInteractiveProject(language, entrypointOverride = null) {
+    const sourceFiles = files.filter(
+      (file) => getLanguageFromPath(file.path) === language,
+    );
 
-    if (projectFiles.length === 0) {
+    if (sourceFiles.length === 0) {
       appendTerminalOutput(
         `\nNo ${getLanguageLabel(language)} files exist in this workspace.\n`,
       );
@@ -570,10 +767,12 @@ export default function App() {
           type: "start",
           request: {
             language,
-            files: projectFiles,
-            entrypoint: getEntrypoint(
+            // Send every file, not just source code. Python programs often
+            // need JSON/CSV/text assets and imports can live in subfolders.
+            files,
+            entrypoint: entrypointOverride || getEntrypoint(
               language,
-              projectFiles,
+              sourceFiles,
             ),
           },
         }),
@@ -650,14 +849,19 @@ export default function App() {
 
     if (
       selectedLanguage !== "python" &&
-      selectedLanguage !== "java"
+      selectedLanguage !== "java" &&
+      selectedLanguage !== "javascript" &&
+      selectedLanguage !== "cpp"
     ) {
       window.alert("Select a Python or Java file first.");
       return;
     }
 
     runQueueRef.current = [];
-    startInteractiveProject(selectedLanguage);
+    startInteractiveProject(
+      selectedLanguage,
+      getEntrypoint(selectedLanguage, [selectedFile]),
+    );
   }
 
   function runAllProjects() {
@@ -671,9 +875,17 @@ export default function App() {
       languagesToRun.push("java");
     }
 
+    if (javascriptFiles.length > 0) {
+      languagesToRun.push("javascript");
+    }
+
+    if (cppFiles.length > 0) {
+      languagesToRun.push("cpp");
+    }
+
     if (languagesToRun.length === 0) {
       window.alert(
-        "Create a Python or Java file before running.",
+        "Create a Python, Java, JavaScript, or C++ file before running.",
       );
       return;
     }
@@ -746,21 +958,28 @@ export default function App() {
           >
             Open Workspace
           </button>
+
+          <button
+            className="open-workspace"
+            onClick={chooseWorkspaceDirectory}
+            title="Choose where new projects are saved"
+          >
+            Project Folder
+          </button>
         </nav>
 
         <section className="hero">
           <p className="hero-label">
-            SELF-HOSTED MULTI-LANGUAGE IDE
+            SELF-HOSTED DESKTOP WORKSPACE IDE
           </p>
 
           <h1>
-            Code online with
+            Build local projects with
             <span> SpCompiler.</span>
           </h1>
 
           <p>
-            Create and run Python and Java projects in one
-            workspace.
+            Create and run local projects with permanent storage in a folder you choose.
           </p>
 
           <input
@@ -841,13 +1060,88 @@ export default function App() {
       )}
 
       <header className="ide-header">
+        <div className="file-menu-container">
+          <button
+            className="file-menu-button"
+            onClick={() => setFileMenuOpen((isOpen) => !isOpen)}
+            aria-expanded={fileMenuOpen}
+          >
+            File
+          </button>
+
+          {fileMenuOpen && (
+            <div className="file-menu" role="menu">
+              <button
+                onClick={() => {
+                  setFileMenuOpen(false);
+                  setScreen("home");
+                }}
+              >
+                New Project...
+              </button>
+
+              <button
+                onClick={() => {
+                  setFileMenuOpen(false);
+                  openWorkspace();
+                }}
+              >
+                📁 Open Workspace...
+              </button>
+
+              <button
+                onClick={() => {
+                  setFileMenuOpen(false);
+                  chooseWorkspaceDirectory();
+                }}
+              >
+                Change Project Folder...
+              </button>
+
+              <div className="file-menu-divider" />
+
+              <button
+                disabled={files.length === 0}
+                onClick={() => {
+                  setFileMenuOpen(false);
+                  saveAllFiles();
+                }}
+              >
+                💾 Save All
+                <small>Ctrl+S</small>
+              </button>
+
+              <button
+                disabled={!workspaceDirectory}
+                onClick={() => {
+                  setFileMenuOpen(false);
+                  reloadWorkspace();
+                }}
+              >
+                ↻ Reload All from Disk
+              </button>
+
+              <div className="file-menu-divider" />
+
+              <button
+                onClick={() => {
+                  setFileMenuOpen(false);
+                  closeProject();
+                }}
+              >
+                Close Project
+              </button>
+            </div>
+          )}
+        </div>
+
         <button
           className="ide-brand"
           onClick={() => setScreen("home")}
           title="Return to language selection"
         >
           <span>&lt;/&gt;</span>
-          SpCompiler
+          SpCompiler ({getWorkspaceLabel(workspaceDirectory)})
         </button>
 
         <div className="top-actions">
@@ -1054,7 +1348,7 @@ export default function App() {
               <div className="file-tree">
                 {files.length === 0 && (
                   <p className="empty-tree">
-                    Click ＋ to create a Python or Java file.
+                    Click ＋ to create a file or folder path.
                   </p>
                 )}
 
@@ -1163,15 +1457,14 @@ export default function App() {
                 </button>
               </div>
 
-              <h3>Browser saved</h3>
+              <h3>Desktop App Disk Workspace</h3>
 
               <p>
-                Your project files are automatically saved in this
-                browser storage securely.
+                Your project files are stored permanently in <code>{workspaceDirectory || "your selected project folder"}</code>.
               </p>
 
               <p>
-                Refreshing this page keeps your active current session files.
+                Autosave is {autoSaveEnabled ? "on" : "off"}. You can change it in Editor Settings.
               </p>
             </div>
           )}
@@ -1226,6 +1519,39 @@ export default function App() {
 
                 <span>Use Tokyo Night theme</span>
               </label>
+
+              <label className="checkbox-setting">
+                <input
+                  type="checkbox"
+                  checked={autoSaveEnabled}
+                  onChange={(event) =>
+                    setAutoSaveEnabled(event.target.checked)
+                  }
+                />
+
+                <span>Autosave files while typing</span>
+              </label>
+
+              <div className="setting-label">
+                <span>Permanent project folder</span>
+
+                <code>{workspaceDirectory || "Loading..."}</code>
+
+                <button
+                  className="clear-console-btn"
+                  onClick={chooseWorkspaceDirectory}
+                >
+                  Choose folder
+                </button>
+              </div>
+
+              <button
+                className="clear-console-btn"
+                disabled={!selectedFile}
+                onClick={saveSelectedFile}
+              >
+                Save current file
+              </button>
 
               <button
                 className="clear-console-btn"
@@ -1437,7 +1763,7 @@ export default function App() {
         )}
       </section>
 
-      <footer className="status-bar">
+      <header className="status-bar">
         <span>
           {isTerminalActive
             ? "● Program running"
@@ -1451,7 +1777,7 @@ export default function App() {
         </span>
 
         <span>{getLanguageLabel(selectedLanguage)}</span>
-      </footer>
+      </header>
     </main>
   );
 }
