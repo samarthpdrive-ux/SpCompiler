@@ -149,6 +149,18 @@ function getWorkspaceLabel(directory) {
   return directory.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || "Workspace";
 }
 
+function getParentDirectory(filePath) {
+  const separatorIndex = Math.max(
+    filePath.lastIndexOf("/"),
+    filePath.lastIndexOf("\\"),
+  );
+  return separatorIndex > 0 ? filePath.slice(0, separatorIndex) : "";
+}
+
+function getFileName(filePath) {
+  return filePath.split(/[\\/]/).pop() || "";
+}
+
 export default function App() {
   const [screen, setScreen] = useState("home");
 
@@ -308,18 +320,17 @@ export default function App() {
   }, [autoSaveEnabled]);
 
   async function chooseWorkspaceDirectory() {
-    let directory = null;
     const nativeChooser = window.pywebview?.api?.choose_workspace_directory;
 
     try {
-      if (nativeChooser) {
-        directory = await nativeChooser();
-      } else {
-        directory = window.prompt(
-          "Enter an absolute folder path for permanent projects:",
-          workspaceDirectory || "C:\\SpCompilerProjects",
+      if (!nativeChooser) {
+        window.alert(
+          "Open SpCompiler through the desktop app to choose a project folder.",
         );
+        return null;
       }
+
+      const directory = await nativeChooser();
 
       if (!directory) {
         return null;
@@ -344,7 +355,11 @@ export default function App() {
     }
   }
 
-  async function loadWorkspace(directory, languageToCreate = null) {
+  async function loadWorkspace(
+    directory,
+    languageToCreate = null,
+    preferredFilePath = "",
+  ) {
     if (saveTimeoutRef.current) {
       clearTimeout(saveTimeoutRef.current);
       saveTimeoutRef.current = null;
@@ -360,7 +375,11 @@ export default function App() {
       }
 
       let workspaceFiles = data.files;
-      let selectedFilePath = workspaceFiles[0]?.path || "";
+      let selectedFilePath = workspaceFiles.some(
+        (file) => file.path === preferredFilePath,
+      )
+        ? preferredFilePath
+        : workspaceFiles[0]?.path || "";
 
       if (languageToCreate) {
         const existingSource = workspaceFiles.find(
@@ -434,6 +453,44 @@ export default function App() {
     }
   }
 
+  async function openFile() {
+    const nativeChooser = window.pywebview?.api?.choose_file;
+
+    if (!nativeChooser) {
+      window.alert("Open SpCompiler through the desktop app to select a file.");
+      return;
+    }
+
+    try {
+      const fullPath = await nativeChooser();
+      if (!fullPath) {
+        return;
+      }
+
+      const directory = getParentDirectory(fullPath);
+      const fileName = getFileName(fullPath);
+      if (!directory || !fileName) {
+        throw new Error("The selected file path is invalid.");
+      }
+
+      const response = await fetch("/api/settings/workspace", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ workspace_dir: directory }),
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.detail || "Could not open the selected file.");
+      }
+
+      setWorkspaceDirectory(data.workspace_dir);
+      setWorkspaceSelected(true);
+      await loadWorkspace(data.workspace_dir, null, fileName);
+    } catch (error) {
+      window.alert(`Could not open file: ${error.message}`);
+    }
+  }
+
   function selectLeftPanel(panelName) {
     if (leftPanel === panelName && explorerVisible) {
       setExplorerVisible(false);
@@ -453,26 +510,52 @@ export default function App() {
   }
 
   async function addFile() {
-    const path = window.prompt(
-      "Enter relative file path (e.g. main.py, src/utils.py, Main.java):",
-    );
-
-    if (!path) {
-      return;
-    }
-
-    // Accept any valid file creation path without strict extension restriction or prompt alerts blocking folder paths
-    if (files.some((file) => file.path === path)) {
-      window.alert("A file with that path already exists.");
+    const nativeChooser = window.pywebview?.api?.choose_new_file;
+    if (!nativeChooser) {
+      window.alert("Open SpCompiler through the desktop app to create a file.");
       return;
     }
 
     try {
+      const fullPath = await nativeChooser(workspaceDirectory || null);
+      if (!fullPath) {
+        return;
+      }
+
+      const directory = getParentDirectory(fullPath);
+      const path = getFileName(fullPath);
+      if (!directory || !path) {
+        throw new Error("The selected file path is invalid.");
+      }
+
+      const workspaceResponse = await fetch("/api/settings/workspace", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ workspace_dir: directory }),
+      });
+      const workspaceData = await workspaceResponse.json();
+      if (!workspaceResponse.ok) {
+        throw new Error(workspaceData.detail || "Could not select this folder.");
+      }
+
+      setWorkspaceDirectory(workspaceData.workspace_dir);
+      setWorkspaceSelected(true);
+
+      const existingResponse = await fetch(
+        `/api/files/read?project_name=.&file_path=${encodeURIComponent(path)}`,
+      );
+
+      if (!existingResponse.ok && existingResponse.status !== 404) {
+        const error = await existingResponse.json().catch(() => ({}));
+        throw new Error(error.detail || "Could not inspect the selected file.");
+      }
+
+      if (existingResponse.status === 404) {
       const saveResponse = await fetch("/api/files/save", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          project_name: projectName,
+          project_name: ".",
           file_path: path,
           content: "",
         }),
@@ -481,42 +564,47 @@ export default function App() {
         const error = await saveResponse.json().catch(() => ({}));
         throw new Error(error.detail || "The file path is invalid.");
       }
+      }
 
-      setFiles((currentFiles) => [
-        ...currentFiles,
-        {
-          path,
-          content: "",
-        },
-      ]);
-
-      setSelectedPath(path);
-      setExplorerVisible(true);
-      setLeftPanel("files");
+      await loadWorkspace(workspaceData.workspace_dir, null, path);
     } catch (error) {
       window.alert(`Could not create file: ${error.message}`);
     }
   }
 
-  function deleteSelectedFile() {
-    if (!selectedPath) {
+  async function deleteSelectedFile(pathToDelete = selectedPath) {
+    if (!pathToDelete) {
       return;
     }
 
     const shouldDelete = window.confirm(
-      `Delete ${selectedPath}?`,
+      `Delete ${pathToDelete}?`,
     );
 
     if (!shouldDelete) {
       return;
     }
 
-    const remainingFiles = files.filter(
-      (file) => file.path !== selectedPath,
-    );
+    try {
+      const response = await fetch(
+        `/api/files?project_name=${encodeURIComponent(projectName)}&file_path=${encodeURIComponent(pathToDelete)}`,
+        { method: "DELETE" },
+      );
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({}));
+        throw new Error(error.detail || "Could not delete the file.");
+      }
 
-    setFiles(remainingFiles);
-    setSelectedPath(remainingFiles[0]?.path || "");
+      const remainingFiles = files.filter(
+        (file) => file.path !== pathToDelete,
+      );
+      setFiles(remainingFiles);
+      if (selectedPath === pathToDelete) {
+        setSelectedPath(remainingFiles[0]?.path || "");
+      }
+    } catch (error) {
+      window.alert(`Delete failed: ${error.message}`);
+    }
   }
 
   function updateFileContent(content) {
@@ -961,6 +1049,20 @@ export default function App() {
 
           <button
             className="open-workspace"
+            onClick={openFile}
+          >
+            Open File
+          </button>
+
+          <button
+            className="open-workspace"
+            onClick={addFile}
+          >
+            New File
+          </button>
+
+          <button
+            className="open-workspace"
             onClick={chooseWorkspaceDirectory}
             title="Choose where new projects are saved"
           >
@@ -1087,6 +1189,24 @@ export default function App() {
                 }}
               >
                 📁 Open Workspace...
+              </button>
+
+              <button
+                onClick={() => {
+                  setFileMenuOpen(false);
+                  openFile();
+                }}
+              >
+                📄 Open File...
+              </button>
+
+              <button
+                onClick={() => {
+                  setFileMenuOpen(false);
+                  addFile();
+                }}
+              >
+                ＋ New File...
               </button>
 
               <button
@@ -1375,13 +1495,7 @@ export default function App() {
                         title="Delete file"
                         onClick={(e) => {
                           e.stopPropagation();
-                          if (window.confirm(`Delete ${file.path}?`)) {
-                            const remaining = files.filter(f => f.path !== file.path);
-                            setFiles(remaining);
-                            if (selectedPath === file.path) {
-                              setSelectedPath(remaining[0]?.path || "");
-                            }
-                          }
+                          deleteSelectedFile(file.path);
                         }}
                       >
                         ×
