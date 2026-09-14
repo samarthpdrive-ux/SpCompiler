@@ -11,6 +11,7 @@ from fastapi import WebSocket, WebSocketDisconnect
 
 from app.models import RunRequest
 from app.services.execution_service import (
+    build_project_environment,
     ExecutionError,
     RUNNERS,
 )
@@ -59,7 +60,7 @@ class InteractiveTerminalService:
             )
 
             # Ensure real-time unbuffered output piping across all OS platforms
-            env = os.environ.copy()
+            env = build_project_environment(workspace_dir)
             env["PYTHONUNBUFFERED"] = "1"
 
             process = await asyncio.create_subprocess_exec(
