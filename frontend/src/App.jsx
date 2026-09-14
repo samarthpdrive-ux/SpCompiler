@@ -149,18 +149,6 @@ function getWorkspaceLabel(directory) {
   return directory.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || "Workspace";
 }
 
-function getParentDirectory(filePath) {
-  const separatorIndex = Math.max(
-    filePath.lastIndexOf("/"),
-    filePath.lastIndexOf("\\"),
-  );
-  return separatorIndex > 0 ? filePath.slice(0, separatorIndex) : "";
-}
-
-function getFileName(filePath) {
-  return filePath.split(/[\\/]/).pop() || "";
-}
-
 export default function App() {
   const [screen, setScreen] = useState("home");
 
@@ -169,8 +157,11 @@ export default function App() {
 
   const [projectName, setProjectName] = useState("");
   const [files, setFiles] = useState([]);
+  const [folders, setFolders] = useState([]);
   const [workspaceDirectory, setWorkspaceDirectory] = useState("");
-  const [workspaceSelected, setWorkspaceSelected] = useState(false);
+  const [startLanguage, setStartLanguage] = useState("");
+  const [createDialog, setCreateDialog] = useState("");
+  const [newItemPath, setNewItemPath] = useState("");
   const [autoSaveEnabled, setAutoSaveEnabled] = useState(() =>
     window.localStorage.getItem("spcompiler-autosave") !== "false",
   );
@@ -207,6 +198,8 @@ export default function App() {
   const runQueueRef = useRef([]);
   const appContainerRef = useRef(null);
   const saveTimeoutRef = useRef(null);
+  const openFileInputRef = useRef(null);
+  const openWorkspaceInputRef = useRef(null);
 
   const selectedFile = files.find(
     (file) => file.path === selectedPath,
@@ -307,7 +300,6 @@ export default function App() {
       .then((response) => response.json())
       .then((data) => {
         setWorkspaceDirectory(data.workspace_dir || "");
-        setWorkspaceSelected(Boolean(data.is_configured));
       })
       .catch(() => {});
   }, []);
@@ -318,42 +310,6 @@ export default function App() {
       String(autoSaveEnabled),
     );
   }, [autoSaveEnabled]);
-
-  async function chooseWorkspaceDirectory() {
-    const nativeChooser = window.pywebview?.api?.choose_workspace_directory;
-
-    try {
-      if (!nativeChooser) {
-        window.alert(
-          "Open SpCompiler through the desktop app to choose a project folder.",
-        );
-        return null;
-      }
-
-      const directory = await nativeChooser();
-
-      if (!directory) {
-        return null;
-      }
-
-      const response = await fetch("/api/settings/workspace", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ workspace_dir: directory }),
-      });
-      const data = await response.json();
-      if (!response.ok) {
-        throw new Error(data.detail || "Could not set the workspace folder.");
-      }
-
-      setWorkspaceDirectory(data.workspace_dir);
-      setWorkspaceSelected(true);
-      return data.workspace_dir;
-    } catch (error) {
-      window.alert(`Could not set project folder: ${error.message}`);
-      return null;
-    }
-  }
 
   async function loadWorkspace(
     directory,
@@ -421,6 +377,7 @@ export default function App() {
       setWorkspaceDirectory(directory);
       setProjectName(".");
       setFiles(workspaceFiles);
+      setFolders(data.folders || []);
       setSelectedPath(selectedFilePath);
       setTerminalOutput("");
       setTerminalInput("");
@@ -437,58 +394,16 @@ export default function App() {
   }
 
   async function createProject(language) {
-    const directory = workspaceSelected
-      ? workspaceDirectory
-      : await chooseWorkspaceDirectory();
-
-    if (directory) {
-      await loadWorkspace(directory, language);
-    }
+    await loadWorkspace(workspaceDirectory || "Web Workspace", language);
+    setStartLanguage("");
   }
 
-  async function openWorkspace() {
-    const directory = await chooseWorkspaceDirectory();
-    if (directory) {
-      await loadWorkspace(directory);
-    }
+  function openWorkspace() {
+    openWorkspaceInputRef.current?.click();
   }
 
-  async function openFile() {
-    const nativeChooser = window.pywebview?.api?.choose_file;
-
-    if (!nativeChooser) {
-      window.alert("Open SpCompiler through the desktop app to select a file.");
-      return;
-    }
-
-    try {
-      const fullPath = await nativeChooser();
-      if (!fullPath) {
-        return;
-      }
-
-      const directory = getParentDirectory(fullPath);
-      const fileName = getFileName(fullPath);
-      if (!directory || !fileName) {
-        throw new Error("The selected file path is invalid.");
-      }
-
-      const response = await fetch("/api/settings/workspace", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ workspace_dir: directory }),
-      });
-      const data = await response.json();
-      if (!response.ok) {
-        throw new Error(data.detail || "Could not open the selected file.");
-      }
-
-      setWorkspaceDirectory(data.workspace_dir);
-      setWorkspaceSelected(true);
-      await loadWorkspace(data.workspace_dir, null, fileName);
-    } catch (error) {
-      window.alert(`Could not open file: ${error.message}`);
-    }
+  function openFile() {
+    openFileInputRef.current?.click();
   }
 
   function selectLeftPanel(panelName) {
@@ -509,66 +424,92 @@ export default function App() {
     );
   }
 
-  async function addFile() {
-    const nativeChooser = window.pywebview?.api?.choose_new_file;
-    if (!nativeChooser) {
-      window.alert("Open SpCompiler through the desktop app to create a file.");
+  function addFile() {
+    setNewItemPath("");
+    setCreateDialog("file");
+  }
+
+  function addFolder() {
+    setNewItemPath("");
+    setCreateDialog("folder");
+  }
+
+  async function createWorkspaceItem(event) {
+    event.preventDefault();
+    const path = newItemPath.trim().replace(/\\/g, "/");
+    if (!path) {
       return;
     }
 
     try {
-      const fullPath = await nativeChooser(workspaceDirectory || null);
-      if (!fullPath) {
-        return;
-      }
-
-      const directory = getParentDirectory(fullPath);
-      const path = getFileName(fullPath);
-      if (!directory || !path) {
-        throw new Error("The selected file path is invalid.");
-      }
-
-      const workspaceResponse = await fetch("/api/settings/workspace", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ workspace_dir: directory }),
-      });
-      const workspaceData = await workspaceResponse.json();
-      if (!workspaceResponse.ok) {
-        throw new Error(workspaceData.detail || "Could not select this folder.");
-      }
-
-      setWorkspaceDirectory(workspaceData.workspace_dir);
-      setWorkspaceSelected(true);
-
-      const existingResponse = await fetch(
-        `/api/files/read?project_name=.&file_path=${encodeURIComponent(path)}`,
+      const response = await fetch(
+        createDialog === "folder" ? "/api/folders" : "/api/files/save",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(
+            createDialog === "folder"
+              ? { project_name: ".", folder_path: path }
+              : { project_name: ".", file_path: path, content: "" },
+          ),
+        },
       );
-
-      if (!existingResponse.ok && existingResponse.status !== 404) {
-        const error = await existingResponse.json().catch(() => ({}));
-        throw new Error(error.detail || "Could not inspect the selected file.");
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({}));
+        throw new Error(error.detail || "Could not create this item.");
       }
 
-      if (existingResponse.status === 404) {
-      const saveResponse = await fetch("/api/files/save", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          project_name: ".",
-          file_path: path,
-          content: "",
-        }),
-      });
-      if (!saveResponse.ok) {
-        const error = await saveResponse.json().catch(() => ({}));
-        throw new Error(error.detail || "The file path is invalid.");
-      }
-      }
-
-      await loadWorkspace(workspaceData.workspace_dir, null, path);
+      setCreateDialog("");
+      await loadWorkspace(
+        workspaceDirectory || "Web Workspace",
+        null,
+        createDialog === "file" ? path : "",
+      );
     } catch (error) {
-      window.alert(`Could not create file: ${error.message}`);
+      window.alert(`Create failed: ${error.message}`);
+    }
+  }
+
+  async function uploadBrowserFiles(fileList, language) {
+    const pickedFiles = Array.from(fileList || []);
+    if (pickedFiles.length === 0) {
+      return;
+    }
+
+    try {
+      await Promise.all(pickedFiles.map(async (file) => {
+        const path = (file.webkitRelativePath || file.name)
+          .replaceAll("\\", "/");
+        const content = await file.text();
+        if (content.length > 1_000_000) {
+          throw new Error(`${path} is larger than 1 MB.`);
+        }
+
+        const response = await fetch("/api/files/save", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            project_name: ".",
+            file_path: path,
+            content,
+          }),
+        });
+        if (!response.ok) {
+          const error = await response.json().catch(() => ({}));
+          throw new Error(error.detail || `Could not upload ${path}.`);
+        }
+      }));
+
+      const supportedLanguage = ["python", "java", "javascript", "cpp"].includes(language)
+        ? language
+        : null;
+      await loadWorkspace(
+        workspaceDirectory || "Web Workspace",
+        supportedLanguage,
+      );
+      setStartLanguage("");
+    } catch (error) {
+      window.alert(`Could not open files: ${error.message}`);
     }
   }
 
@@ -1039,49 +980,20 @@ export default function App() {
             <span className="brand-icon">&lt;/&gt;</span>
             SpCompiler
           </button>
-
-          <button
-            className="open-workspace"
-            onClick={openWorkspace}
-          >
-            Open Workspace
-          </button>
-
-          <button
-            className="open-workspace"
-            onClick={openFile}
-          >
-            Open File
-          </button>
-
-          <button
-            className="open-workspace"
-            onClick={addFile}
-          >
-            New File
-          </button>
-
-          <button
-            className="open-workspace"
-            onClick={chooseWorkspaceDirectory}
-            title="Choose where new projects are saved"
-          >
-            Project Folder
-          </button>
         </nav>
 
         <section className="hero">
           <p className="hero-label">
-            SELF-HOSTED DESKTOP WORKSPACE IDE
+            WEB-BASED MULTI-FILE IDE
           </p>
 
           <h1>
-            Build local projects with
+            Build projects with
             <span> SpCompiler.</span>
           </h1>
 
           <p>
-            Create and run local projects with permanent storage in a folder you choose.
+            Select Python or Java, then open a workspace, upload files, or start a new project.
           </p>
 
           <input
@@ -1127,7 +1039,7 @@ export default function App() {
                 }
                 key={card.id}
                 disabled={!card.enabled}
-                onClick={() => createProject(card.id)}
+                onClick={() => setStartLanguage(card.id)}
               >
                 <span className="language-icon">
                   {card.icon}
@@ -1141,6 +1053,68 @@ export default function App() {
             ))}
           </div>
         </section>
+
+        <input
+          ref={openFileInputRef}
+          className="browser-file-input"
+          type="file"
+          multiple
+          onChange={(event) => {
+            uploadBrowserFiles(event.target.files, startLanguage);
+            event.target.value = "";
+          }}
+        />
+
+        <input
+          ref={openWorkspaceInputRef}
+          className="browser-file-input"
+          type="file"
+          multiple
+          webkitdirectory=""
+          directory=""
+          onChange={(event) => {
+            uploadBrowserFiles(event.target.files, startLanguage);
+            event.target.value = "";
+          }}
+        />
+
+        {startLanguage && (
+          <div className="web-dialog-backdrop" role="presentation">
+            <section
+              className="web-dialog"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="workspace-start-title"
+            >
+              <button
+                className="dialog-close"
+                onClick={() => setStartLanguage("")}
+                aria-label="Close"
+              >
+                ×
+              </button>
+              <p className="hero-label">{getLanguageLabel(startLanguage)} PROJECT</p>
+              <h2 id="workspace-start-title">How would you like to begin?</h2>
+              <p>
+                Open an existing folder or file from your device, or create a new server workspace.
+              </p>
+              <div className="workspace-start-actions">
+                <button onClick={openWorkspace}>
+                  <strong>📁 Open Workspace</strong>
+                  <span>Choose a folder and preserve its Python or Java subfolders.</span>
+                </button>
+                <button onClick={openFile}>
+                  <strong>📄 Open File</strong>
+                  <span>Choose one or more source, config, or `.env` files.</span>
+                </button>
+                <button onClick={() => createProject(startLanguage)}>
+                  <strong>＋ Create New</strong>
+                  <span>Start with a blank {startLanguage === "java" ? "Main.java" : "main.py"} file.</span>
+                </button>
+              </div>
+            </section>
+          </div>
+        )}
       </main>
     );
   }
@@ -1151,6 +1125,61 @@ export default function App() {
       data-theme={theme}
       ref={appContainerRef}
     >
+      <input
+        ref={openFileInputRef}
+        className="browser-file-input"
+        type="file"
+        multiple
+        onChange={(event) => {
+          uploadBrowserFiles(event.target.files, selectedLanguage);
+          event.target.value = "";
+        }}
+      />
+
+      <input
+        ref={openWorkspaceInputRef}
+        className="browser-file-input"
+        type="file"
+        multiple
+        webkitdirectory=""
+        directory=""
+        onChange={(event) => {
+          uploadBrowserFiles(event.target.files, selectedLanguage);
+          event.target.value = "";
+        }}
+      />
+
+      {createDialog && (
+        <div className="web-dialog-backdrop" role="presentation">
+          <form className="web-dialog item-dialog" onSubmit={createWorkspaceItem}>
+            <button
+              type="button"
+              className="dialog-close"
+              onClick={() => setCreateDialog("")}
+              aria-label="Close"
+            >
+              ×
+            </button>
+            <h2>{createDialog === "folder" ? "Create Folder" : "Create File"}</h2>
+            <p>
+              {createDialog === "folder"
+                ? "Use a relative folder path, for example src/services."
+                : "Use a relative file path, for example src/main.py or config/.env."}
+            </p>
+            <input
+              autoFocus
+              value={newItemPath}
+              onChange={(event) => setNewItemPath(event.target.value)}
+              placeholder={createDialog === "folder" ? "src/services" : "src/main.py"}
+            />
+            <div className="dialog-actions">
+              <button type="button" onClick={() => setCreateDialog("")}>Cancel</button>
+              <button className="primary" type="submit">Create</button>
+            </div>
+          </form>
+        </div>
+      )}
+
       {isFullscreen && (
         <button
           className="fullscreen-exit-btn"
@@ -1207,15 +1236,6 @@ export default function App() {
                 }}
               >
                 ＋ New File...
-              </button>
-
-              <button
-                onClick={() => {
-                  setFileMenuOpen(false);
-                  chooseWorkspaceDirectory();
-                }}
-              >
-                Change Project Folder...
               </button>
 
               <div className="file-menu-divider" />
@@ -1457,6 +1477,13 @@ export default function App() {
                   </button>
 
                   <button
+                    onClick={addFolder}
+                    title="Create folder"
+                  >
+                    📁
+                  </button>
+
+                  <button
                     onClick={() => setExplorerVisible(false)}
                     title="Hide explorer"
                   >
@@ -1466,11 +1493,17 @@ export default function App() {
               </div>
 
               <div className="file-tree">
-                {files.length === 0 && (
+                {files.length === 0 && folders.length === 0 && (
                   <p className="empty-tree">
-                    Click ＋ to create a file or folder path.
+                    Use ＋ to create a file or 📁 to create a folder.
                   </p>
                 )}
+
+                {folders.map((folder) => (
+                  <div className="tree-folder" key={folder}>
+                    <span>📁 {folder}</span>
+                  </div>
+                ))}
 
                 {files.map((file) => (
                   <div
@@ -1647,16 +1680,9 @@ export default function App() {
               </label>
 
               <div className="setting-label">
-                <span>Permanent project folder</span>
+                <span>Server workspace</span>
 
-                <code>{workspaceDirectory || "Loading..."}</code>
-
-                <button
-                  className="clear-console-btn"
-                  onClick={chooseWorkspaceDirectory}
-                >
-                  Choose folder
-                </button>
+                <code>{workspaceDirectory || "Server workspace"}</code>
               </div>
 
               <button
