@@ -16,7 +16,7 @@ class SourceFile(BaseModel):
 
 
 class RunRequest(BaseModel):
-    language: Literal["python", "java"]
+    language: Literal["python", "java", "javascript", "cpp"]
     files: list[SourceFile] = Field(
         min_length=1,
         max_length=50,
@@ -40,3 +40,28 @@ class RunResponse(BaseModel):
     stderr: str
     duration_ms: int
     timed_out: bool
+
+
+class ProjectCreate(BaseModel):
+    project_name: str = Field(
+        min_length=1,
+        max_length=100,
+        examples=["my_python_project"],
+    )
+
+
+class FileSaveRequest(BaseModel):
+    project_name: str = Field(
+        min_length=1,
+        max_length=100,
+        examples=["my_python_project"],
+    )
+    file_path: str = Field(
+        min_length=1,
+        max_length=200,
+        examples=["src/main.py", "utils.py"],
+    )
+    content: str = Field(
+        default="",
+        max_length=1_000_000,
+    )
