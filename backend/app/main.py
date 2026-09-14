@@ -92,6 +92,11 @@ class FileSaveRequest(BaseModel):
     content: str
 
 
+class FolderCreateRequest(BaseModel):
+    project_name: str
+    folder_path: str
+
+
 class WorkspaceDirectoryRequest(BaseModel):
     workspace_dir: str
 
@@ -203,6 +208,29 @@ def save_file(data: FileSaveRequest):
     return {"status": "saved", "file_path": data.file_path, "path": full_file_path}
 
 
+@app.post("/api/folders")
+def create_folder(data: FolderCreateRequest):
+    """Create an empty nested folder inside the current web workspace."""
+    project_path = get_project_path(data.project_name)
+    if not os.path.isdir(project_path):
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    folder_path = data.folder_path.strip().replace("\\", "/")
+    if folder_path in {"", "."}:
+        raise HTTPException(status_code=400, detail="A folder name is required")
+
+    full_folder_path = get_file_path(project_path, folder_path)
+    try:
+        os.makedirs(full_folder_path, exist_ok=True)
+    except OSError as error:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not create folder: {error}",
+        ) from error
+
+    return {"status": "created", "folder_path": folder_path}
+
+
 @app.delete("/api/files")
 def delete_file(project_name: str, file_path: str):
     """Delete one project file, never a directory or a path outside the workspace."""
@@ -245,7 +273,11 @@ def list_project_files(project_name: str):
         raise HTTPException(status_code=404, detail="Project not found")
 
     files = []
+    folders = []
     for path in Path(project_path).rglob("*"):
+        if path.is_dir():
+            folders.append(path.relative_to(project_path).as_posix())
+            continue
         if not path.is_file():
             continue
         try:
@@ -258,7 +290,10 @@ def list_project_files(project_name: str):
             "content": content,
         })
 
-    return {"files": sorted(files, key=lambda file: file["path"].lower())}
+    return {
+        "files": sorted(files, key=lambda file: file["path"].lower()),
+        "folders": sorted(folders, key=str.lower),
+    }
 
 
 @app.websocket("/api/terminal")
