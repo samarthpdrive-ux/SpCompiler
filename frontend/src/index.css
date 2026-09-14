@@ -275,6 +275,68 @@ button:disabled {
   background: #181818;
 }
 
+.file-menu-container {
+  position: relative;
+  justify-self: start;
+}
+
+.file-menu-button {
+  min-height: 30px;
+  padding: 5px 10px;
+  border-radius: 4px;
+  color: #d4d4d4;
+  background: transparent;
+  font-size: 0.85rem;
+}
+
+.file-menu-button:hover,
+.file-menu-button[aria-expanded="true"] {
+  background: #37373d;
+}
+
+.file-menu {
+  position: absolute;
+  z-index: 30;
+  top: 36px;
+  left: 0;
+  width: 250px;
+  padding: 5px 0;
+  border: 1px solid #454545;
+  box-shadow: 0 10px 25px rgba(0, 0, 0, 0.45);
+  background: #252526;
+}
+
+.file-menu button {
+  display: flex;
+  width: 100%;
+  min-height: 32px;
+  padding: 6px 14px;
+  align-items: center;
+  justify-content: space-between;
+  color: #f0f0f0;
+  background: transparent;
+  font-size: 0.85rem;
+  text-align: left;
+}
+
+.file-menu button:hover:not(:disabled) {
+  background: #094771;
+}
+
+.file-menu button:disabled {
+  color: #777777;
+}
+
+.file-menu small {
+  color: #9d9d9d;
+}
+
+.file-menu-divider {
+  height: 1px;
+  margin: 5px 0;
+  background: #454545;
+}
+
 .ide-brand {
   display: flex;
   align-items: center;
@@ -615,6 +677,13 @@ button:disabled {
 .setting-label input {
   width: 100%;
   accent-color: #007acc;
+}
+
+.setting-label code {
+  overflow-wrap: anywhere;
+  color: #9cdcfe;
+  font-size: 0.75rem;
+  line-height: 1.35;
 }
 
 .checkbox-setting {
