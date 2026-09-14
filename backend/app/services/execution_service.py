@@ -38,6 +38,47 @@ RUNNERS = {
 }
 
 
+def build_project_environment(workspace_dir: str) -> dict[str, str]:
+    """Return a child-process environment enriched with the project's .env file.
+
+    The `.env` file is still written into the temporary workspace, so programs
+    can also read it directly.  Loading these simple KEY=value entries here
+    additionally makes `os.getenv("KEY")` and `System.getenv("KEY")` work.
+    """
+    environment = os.environ.copy()
+    dotenv_path = Path(workspace_dir) / ".env"
+
+    if not dotenv_path.is_file():
+        return environment
+
+    try:
+        lines = dotenv_path.read_text(encoding="utf-8-sig").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return environment
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+
+        key, separator, value = line.partition("=")
+        key = key.strip()
+        if not separator or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            continue
+
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        elif " #" in value:
+            value = value.split(" #", 1)[0].rstrip()
+
+        environment[key] = value
+
+    return environment
+
+
 class ExecutionService:
     TIMEOUT_SECONDS = 10
     MAX_OUTPUT_BYTES = 1 * 1024 * 1024  # 1 MB max output limit
@@ -120,7 +161,7 @@ class ExecutionService:
         stdout_data = bytearray()
         stderr_data = bytearray()
 
-        env = os.environ.copy()
+        env = build_project_environment(workspace_dir)
         env["PYTHONUNBUFFERED"] = "1"
 
         exec_kwargs = {
@@ -225,7 +266,7 @@ class ExecutionService:
         memory_exceeded = False
         output_exceeded = False
         try:
-            env = os.environ.copy()
+            env = build_project_environment(workspace_dir)
             env["PYTHONUNBUFFERED"] = "1"
 
             sub_kwargs = {
