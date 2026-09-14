@@ -3,6 +3,8 @@ import shutil
 import tempfile
 import sys
 import os
+import shlex
+import re
 from pathlib import Path, PurePosixPath
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -50,7 +52,11 @@ class InteractiveTerminalService:
         try:
             self._write_project_files(workspace_dir, request.files, request.stdin)
 
-            command = self._build_execution_command(request.language, entrypoint)
+            command = self._build_execution_command(
+                request.language,
+                entrypoint,
+                workspace_dir,
+            )
 
             # Ensure real-time unbuffered output piping across all OS platforms
             env = os.environ.copy()
@@ -291,7 +297,8 @@ class InteractiveTerminalService:
 
         for source_file in files:
             safe_path = self._safe_file_path(source_file.path)
-            file_path = workspace_path / safe_path.name
+            # Preserve nested packages, modules, and resource files.
+            file_path = workspace_path.joinpath(*safe_path.parts)
             file_path.parent.mkdir(parents=True, exist_ok=True)
             file_path.write_text(source_file.content, encoding="utf-8")
 
@@ -302,22 +309,55 @@ class InteractiveTerminalService:
         self,
         language: str,
         entrypoint: str,
+        workspace_dir: str,
     ):
         if language == "python":
-            return ["python", "-u", "-B", entrypoint]
+            interpreter = (
+                os.environ.get("SPCOMPILER_PYTHON")
+                or ("python" if getattr(sys, "frozen", False) else sys.executable)
+            )
+            return [interpreter, "-u", "-B", entrypoint]
 
-        if language == "java":
+        if language == "javascript":
+            return ["node", entrypoint]
+
+        if language == "cpp":
+            executable = ".polyworkspace-program.exe" if sys.platform == "win32" else ".polyworkspace-program"
             if sys.platform == "win32":
                 return [
                     "cmd.exe",
                     "/c",
-                    f"javac *.java && java {entrypoint} < {self.RESERVED_FILE_NAME}",
+                    f'g++ "{entrypoint}" -std=c++17 -O2 -o "{executable}" && "{executable}"',
+                ]
+            return [
+                "sh",
+                "-c",
+                f"g++ {shlex.quote(entrypoint)} -std=c++17 -O2 -o {shlex.quote(executable)} && ./{shlex.quote(executable)}",
+            ]
+
+        if language == "java":
+            java_files = []
+            for root, _, names in os.walk(workspace_dir):
+                for name in names:
+                    if name.endswith(".java"):
+                        java_files.append(os.path.relpath(os.path.join(root, name), workspace_dir))
+
+            if not java_files:
+                raise ExecutionError("No Java source files were provided.")
+
+            if sys.platform == "win32":
+                sources = " ".join(f'"{path}"' for path in java_files)
+                return [
+                    "cmd.exe",
+                    "/c",
+                    f"javac -d . {sources} && java {entrypoint}",
                 ]
             else:
+                sources = " ".join(shlex.quote(path) for path in java_files)
                 return [
                     "sh",
                     "-c",
-                    f"javac *.java && java {entrypoint} < {self.RESERVED_FILE_NAME}",
+                    f"javac -d . {sources} && java {shlex.quote(entrypoint)}",
                 ]
 
         raise ExecutionError(f"Unsupported execution language: {language}")
@@ -333,8 +373,12 @@ class InteractiveTerminalService:
             path.is_absolute()
             or ".." in path.parts
             or ":" in normalized
-            or str(path) in {"", "."}
-            or str(path) == self.RESERVED_FILE_NAME
+                or str(path) in {"", "."}
+                or str(path) == self.RESERVED_FILE_NAME
+                or re.fullmatch(
+                    r"[A-Za-z0-9][A-Za-z0-9._ -]*(/[A-Za-z0-9][A-Za-z0-9._ -]*)*",
+                    normalized,
+                ) is None
         ):
             raise ExecutionError(
                 f"Unsafe or reserved file path: {raw_path}"
@@ -347,7 +391,7 @@ class InteractiveTerminalService:
         entrypoint: str,
         language: str,
     ):
-        if language == "python":
+        if language in {"python", "javascript", "cpp"}:
             self._safe_file_path(entrypoint)
 
         if language == "java":
